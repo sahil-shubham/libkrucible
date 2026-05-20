@@ -177,7 +177,9 @@ struct ContextConfig {
     shutdown_efd: Option<EventFd>,
     gpu_virgl_flags: Option<u32>,
     gpu_shm_size: Option<usize>,
-    console_output: Option<PathBuf>,
+    /// Console output path, only used by the aws-nitro TryFrom path.
+    #[cfg(feature = "aws-nitro")]
+    nitro_console_output: Option<PathBuf>,
     vmm_uid: Option<libc::uid_t>,
     vmm_gid: Option<libc::gid_t>,
     #[cfg(all(
@@ -391,7 +393,7 @@ impl TryFrom<ContextConfig> for NitroEnclave {
             }
         };
 
-        let Some(output_path) = ctx.console_output else {
+        let Some(output_path) = ctx.nitro_console_output else {
             error!("console output path not specified");
             return Err(-libc::EINVAL);
         };
@@ -1752,6 +1754,34 @@ pub unsafe extern "C" fn krun_add_vhost_user_device(
     -libc::ENOTSUP
 }
 
+// FIXME: aws-nitro builds its own NitroEnclave from ContextConfig and needs
+// the console output path directly. This should be replaced with a proper
+// console configuration in the nitro path.
+#[allow(clippy::missing_safety_doc)]
+#[unsafe(no_mangle)]
+#[cfg(feature = "aws-nitro")]
+pub unsafe extern "C" fn krun_set_console_output(ctx_id: u32, c_filepath: *const c_char) -> i32 {
+    unsafe {
+        let filepath = match CStr::from_ptr(c_filepath).to_str() {
+            Ok(f) => f,
+            Err(_) => return -libc::EINVAL,
+        };
+
+        match CTX_MAP.lock().unwrap().entry(ctx_id) {
+            Entry::Occupied(mut ctx_cfg) => {
+                let cfg = ctx_cfg.get_mut();
+                if cfg.nitro_console_output.is_some() {
+                    -libc::EINVAL
+                } else {
+                    cfg.nitro_console_output = Some(PathBuf::from(filepath.to_string()));
+                    KRUN_SUCCESS
+                }
+            }
+            Entry::Vacant(_) => -libc::ENOENT,
+        }
+    }
+}
+
 #[allow(unused_assignments)]
 #[unsafe(no_mangle)]
 pub extern "C" fn krun_get_shutdown_eventfd(ctx_id: u32) -> i32 {
@@ -1768,30 +1798,6 @@ pub extern "C" fn krun_get_shutdown_eventfd(ctx_id: u32) -> i32 {
             }
         }
         Entry::Vacant(_) => -libc::ENOENT,
-    }
-}
-
-#[allow(clippy::missing_safety_doc)]
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn krun_set_console_output(ctx_id: u32, c_filepath: *const c_char) -> i32 {
-    unsafe {
-        let filepath = match CStr::from_ptr(c_filepath).to_str() {
-            Ok(f) => f,
-            Err(_) => return -libc::EINVAL,
-        };
-
-        match CTX_MAP.lock().unwrap().entry(ctx_id) {
-            Entry::Occupied(mut ctx_cfg) => {
-                let cfg = ctx_cfg.get_mut();
-                if cfg.console_output.is_some() {
-                    -libc::EINVAL
-                } else {
-                    cfg.console_output = Some(PathBuf::from(filepath.to_string()));
-                    KRUN_SUCCESS
-                }
-            }
-            Entry::Vacant(_) => -libc::ENOENT,
-        }
     }
 }
 
@@ -2510,19 +2516,6 @@ pub unsafe extern "C" fn krun_get_default_init(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn krun_disable_implicit_console(ctx_id: u32) -> i32 {
-    match CTX_MAP.lock().unwrap().entry(ctx_id) {
-        Entry::Occupied(mut ctx_cfg) => {
-            let cfg = ctx_cfg.get_mut();
-            cfg.vmr.disable_implicit_console = true;
-        }
-        Entry::Vacant(_) => return -libc::ENOENT,
-    }
-
-    KRUN_SUCCESS
-}
-
-#[unsafe(no_mangle)]
 pub extern "C" fn krun_disable_implicit_vsock(ctx_id: u32) -> i32 {
     match CTX_MAP.lock().unwrap().entry(ctx_id) {
         Entry::Occupied(mut ctx_cfg) => {
@@ -3008,10 +3001,6 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
     }
     if let Some(shm_size) = ctx_cfg.gpu_shm_size {
         ctx_cfg.vmr.set_gpu_shm_size(shm_size);
-    }
-
-    if let Some(console_output) = ctx_cfg.console_output {
-        ctx_cfg.vmr.set_console_output(console_output);
     }
 
     if let Some(gid) = ctx_cfg.vmm_gid
