@@ -20,7 +20,7 @@ use crate::vmm_config::machine_config::CpuFeaturesTemplate;
 use arch::ArchMemoryInfo;
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TryRecvError, unbounded};
 use devices::legacy::VcpuList;
-use hvf::{HvfVcpu, HvfVm, VcpuExit, Vcpus};
+use hvf::{HvfVcpu, HvfVcpuState, HvfVm, VcpuExit, Vcpus};
 use utils::eventfd::EventFd;
 use vm_memory::{
     Address, GuestAddress, GuestMemory, GuestMemoryError, GuestMemoryMmap, GuestMemoryRegion,
@@ -111,6 +111,38 @@ impl Vm {
 
     pub fn hvf_vm(&self) -> &HvfVm {
         &self.hvf_vm
+    }
+
+    /// Capture VM-level state for a checkpoint: the in-kernel HVF GIC
+    /// distributor (SPI group/priority/config/routing + set-enables). A restored
+    /// VM is a fresh hv_vm whose vGIC is in reset state, so without this its
+    /// device IRQs (e.g. vsock) are masked and never wake the guest from WFI.
+    /// Best-effort: an empty result (no in-kernel GIC) is tolerated.
+    #[cfg(target_arch = "aarch64")]
+    pub fn save_state(&self) -> Result<VmState> {
+        let gic_distributor = match hvf::gic_save_distributor() {
+            Ok(regs) => {
+                debug!("captured {} GIC distributor registers", regs.len());
+                regs
+            }
+            Err(e) => {
+                warn!("GIC distributor capture failed ({e:?}); restored VM may not wake on IRQs");
+                Vec::new()
+            }
+        };
+        Ok(VmState { gic_distributor })
+    }
+
+    /// Restore VM-level state: replay the GIC distributor registers onto the
+    /// restored VM's fresh vGIC (GICD_CTLR enabled last). No-op if empty.
+    #[cfg(target_arch = "aarch64")]
+    pub fn restore_state(&self, state: &VmState) -> Result<()> {
+        if !state.gic_distributor.is_empty() {
+            if let Err(e) = hvf::gic_restore_distributor(&state.gic_distributor) {
+                error!("failed to restore GIC distributor state: {e:?}");
+            }
+        }
+        Ok(())
     }
 
     /// Initializes the guest memory.
@@ -552,6 +584,28 @@ impl Vcpu {
                         .send(VcpuResponse::Paused)
                         .expect("failed to send pause status");
                 }
+                // Cold-to-disk: capture / re-apply this vCPU's register state
+                // while paused (the only safe boundary — HVF register access
+                // must run on the owning vCPU thread). Stays paused afterwards.
+                Ok(VcpuEvent::SaveState) => match hvf::vcpu_save_state(hvf_vcpuid) {
+                    Ok(state) => self
+                        .response_sender
+                        .send(VcpuResponse::SavedState(Box::new(state)))
+                        .expect("failed to send saved vcpu state"),
+                    Err(e) => {
+                        error!("failed to capture HVF vcpu state: {e:?}");
+                        return false;
+                    }
+                },
+                Ok(VcpuEvent::RestoreState(state)) => {
+                    if let Err(e) = hvf::vcpu_restore_state(hvf_vcpuid, &state) {
+                        error!("failed to restore HVF vcpu state: {e:?}");
+                        return false;
+                    }
+                    self.response_sender
+                        .send(VcpuResponse::RestoredState)
+                        .expect("failed to send restored vcpu ack");
+                }
                 Err(_) => return false,
             }
         }
@@ -580,6 +634,12 @@ impl Vcpu {
                 self.response_sender
                     .send(VcpuResponse::Resumed)
                     .expect("failed to send resume status");
+                true
+            }
+            // Save/restore are only valid while paused; the orchestrator always
+            // pauses first, so receiving one here is a protocol error — ignore.
+            VcpuEvent::SaveState | VcpuEvent::RestoreState(_) => {
+                error!("ignoring vcpu SaveState/RestoreState received while running");
                 true
             }
         }
@@ -611,9 +671,13 @@ pub enum VcpuEvent {
     /// nudge the guest virtual-timer offset so its clock doesn't jump forward
     /// on resume (0 on the initial boot resume).
     Resume { paused_ns: u64 },
+    /// Capture the full vCPU register state (the vCPU must be paused).
+    SaveState,
+    /// Restore previously-captured vCPU register state (vCPU paused).
+    RestoreState(Box<VcpuState>),
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug)]
 /// List of responses that the Vcpu reports.
 pub enum VcpuResponse {
     /// Vcpu is paused.
@@ -622,6 +686,59 @@ pub enum VcpuResponse {
     Resumed,
     /// Vcpu is stopped.
     Exited(u8),
+    /// Captured vCPU register state, in reply to [`VcpuEvent::SaveState`].
+    SavedState(Box<VcpuState>),
+    /// Acknowledges a [`VcpuEvent::RestoreState`].
+    RestoredState,
+}
+
+/// Captured HVF vCPU register state (the macOS analogue of KVM's `VcpuState`),
+/// used by the cross-platform checkpoint/restore orchestration in `vmm::lib`.
+pub type VcpuState = HvfVcpuState;
+
+/// VM-level state for a checkpoint: the in-kernel HVF GIC distributor registers
+/// as (reg-offset, value) pairs (see [`Vm::save_state`]). Empty when there is no
+/// in-kernel GIC.
+#[derive(Clone, Debug, Default)]
+pub struct VmState {
+    pub gic_distributor: Vec<(u32, u64)>,
+}
+
+impl VmState {
+    /// Serialize to a little-endian byte blob (mirrors the KVM `VmState` so the
+    /// cross-platform checkpoint can call it uniformly).
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(4 + self.gic_distributor.len() * 12);
+        out.extend_from_slice(&(self.gic_distributor.len() as u32).to_le_bytes());
+        for &(reg, val) in &self.gic_distributor {
+            out.extend_from_slice(&reg.to_le_bytes());
+            out.extend_from_slice(&val.to_le_bytes());
+        }
+        out
+    }
+
+    /// Reconstruct from a blob produced by [`Self::serialize`].
+    pub fn deserialize(bytes: &[u8]) -> std::result::Result<VmState, String> {
+        if bytes.is_empty() {
+            return Ok(VmState::default());
+        }
+        if bytes.len() < 4 {
+            return Err("VmState blob truncated".to_string());
+        }
+        let n = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
+        let mut pos = 4usize;
+        let mut gic_distributor = Vec::with_capacity(n);
+        for _ in 0..n {
+            if pos + 12 > bytes.len() {
+                return Err("VmState blob truncated".to_string());
+            }
+            let reg = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap());
+            let val = u64::from_le_bytes(bytes[pos + 4..pos + 12].try_into().unwrap());
+            gic_distributor.push((reg, val));
+            pos += 12;
+        }
+        Ok(VmState { gic_distributor })
+    }
 }
 
 /// Wrapper over Vcpu that hides the underlying interactions with the Vcpu thread.
@@ -693,6 +810,24 @@ mod tests {
     use arch::aarch64::layout::DRAM_MEM_START_EFI;
     use devices::legacy::VcpuList;
     use vm_memory::{GuestAddress, GuestMemoryMmap};
+
+    // VM-level checkpoint state (GIC distributor pairs) must survive the on-disk
+    // byte roundtrip, including the empty (no in-kernel GIC) case.
+    #[test]
+    fn vm_state_serialize_roundtrip() {
+        let st = VmState {
+            gic_distributor: vec![(0u32, 0x1234u64), (0x80, 0xffff_0000), (0x6000, 0xdead)],
+        };
+        let blob = st.serialize();
+        let got = VmState::deserialize(&blob).expect("deserialize");
+        assert_eq!(got.gic_distributor, st.gic_distributor);
+
+        let empty = VmState::default();
+        let got_empty = VmState::deserialize(&empty.serialize()).expect("deserialize empty");
+        assert!(got_empty.gic_distributor.is_empty());
+        // A zero-length blob is also accepted as empty.
+        assert!(VmState::deserialize(&[]).unwrap().gic_distributor.is_empty());
+    }
 
     // Auxiliary function being used throughout the tests.
     // Does NOT create a real HVF VM — Vcpu::new_aarch64 and most vcpu methods
