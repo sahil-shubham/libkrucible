@@ -38,6 +38,14 @@ use std::slice;
 use std::sync::LazyLock;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicI32, Ordering};
+#[cfg(unix)]
+use std::io::{Read, Write};
+#[cfg(unix)]
+use std::os::unix::net::{UnixListener, UnixStream};
+#[cfg(unix)]
+use std::sync::Arc;
+#[cfg(unix)]
+use std::thread;
 use utils::eventfd::EventFd;
 #[cfg(target_os = "windows")]
 use utils::windows::AsRawFd;
@@ -180,6 +188,9 @@ struct ContextConfig {
     /// Console output path, only used by the aws-nitro TryFrom path.
     #[cfg(feature = "aws-nitro")]
     nitro_console_output: Option<PathBuf>,
+    /// Path of the UDS the control thread serves (PAUSE/RESUME/STATUS). None
+    /// (default) means no control thread is started.
+    control_socket_path: Option<PathBuf>,
     vmm_uid: Option<libc::uid_t>,
     vmm_gid: Option<libc::gid_t>,
     #[cfg(all(
@@ -1761,6 +1772,93 @@ pub extern "C" fn krun_get_shutdown_eventfd(ctx_id: u32) -> i32 {
     }
 }
 
+
+/// Set the path of a Unix domain socket the VMM will serve after build,
+/// before the event loop. Newline commands: "PAUSE\n", "RESUME\n",
+/// "STATUS\n". The reply is one line: "OK <state>\n" or "ERR <reason>\n".
+/// Each connection is one command (the connection closes after the reply).
+///
+/// The control thread shares the running VMM via Arc<Mutex<Vmm>>, so commands
+/// take the lock briefly. Must be called before krun_start_enter().
+#[cfg(unix)]
+#[allow(clippy::missing_safety_doc)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn krun_set_control_socket(
+    ctx_id: u32,
+    c_socket_path: *const c_char,
+) -> i32 {
+    unsafe {
+        let path = match CStr::from_ptr(c_socket_path).to_str() {
+            Ok(p) => p,
+            Err(_) => return -libc::EINVAL,
+        };
+        match CTX_MAP.lock().unwrap().entry(ctx_id) {
+            Entry::Occupied(mut ctx_cfg) => {
+                ctx_cfg.get_mut().control_socket_path = Some(PathBuf::from(path));
+                KRUN_SUCCESS
+            }
+            Entry::Vacant(_) => -libc::ENOENT,
+        }
+    }
+}
+
+/// Serve a single control-socket connection: one newline-terminated command in,
+/// one newline-terminated reply out, then close. Returns the reply string.
+#[cfg(unix)]
+fn control_handle(mut stream: UnixStream, vmm: &Arc<Mutex<vmm::Vmm>>) {
+    let mut buf = [0u8; 64];
+    let n = match stream.read(&mut buf) {
+        Ok(n) if n > 0 => n,
+        _ => return,
+    };
+    let cmd = String::from_utf8_lossy(&buf[..n])
+        .trim()
+        .to_ascii_uppercase();
+    let reply = match cmd.as_str() {
+        "PAUSE" => match vmm.lock().unwrap().pause() {
+            Ok(()) => "OK paused\n".to_string(),
+            Err(e) => format!("ERR pause: {e}\n"),
+        },
+        "RESUME" => match vmm.lock().unwrap().resume() {
+            Ok(()) => "OK running\n".to_string(),
+            Err(e) => format!("ERR resume: {e}\n"),
+        },
+        "STATUS" => {
+            let s = vmm.lock().unwrap().run_state();
+            format!("OK {}\n", s.as_str())
+        }
+        other => format!("ERR unknown command: {other}\n"),
+    };
+    let _ = stream.write_all(reply.as_bytes());
+}
+
+/// Spawn the control-socket listener thread. Idempotent on remove of a stale
+/// UDS path. Returns Ok even if no path is configured (no thread is started).
+#[cfg(unix)]
+fn start_control_socket(
+    path_opt: Option<PathBuf>,
+    vmm: Arc<Mutex<vmm::Vmm>>,
+) -> std::io::Result<()> {
+    let Some(path) = path_opt else {
+        return Ok(());
+    };
+    let _ = std::fs::remove_file(&path);
+    let listener = UnixListener::bind(&path)?;
+    thread::Builder::new()
+        .name("krun-control".into())
+        .spawn(move || {
+            for incoming in listener.incoming() {
+                match incoming {
+                    Ok(stream) => control_handle(stream, &vmm),
+                    Err(e) => {
+                        log::warn!("control socket accept: {e}");
+                    }
+                }
+            }
+        })?;
+    Ok(())
+}
+
 #[allow(clippy::missing_safety_doc)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn krun_set_nested_virt(ctx_id: u32, enabled: bool) -> i32 {
@@ -2964,6 +3062,13 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
 
     #[cfg(any(feature = "amd-sev", feature = "tdx"))]
     vmm::worker::start_worker_thread(_vmm.clone(), _receiver.clone()).unwrap();
+
+    // Spawn the control-socket listener (warm tier). No-op if no path was set.
+    #[cfg(unix)]
+    if let Err(e) = start_control_socket(ctx_cfg.control_socket_path.take(), _vmm.clone()) {
+        error!("Failed to start control socket: {e}");
+        return -libc::EINVAL;
+    }
 
     loop {
         match event_manager.run() {

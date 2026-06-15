@@ -18,3 +18,4 @@ examples/rootfs_fedora
 test-prefix
 /linux-sysroot
 /freebsd-sysroot
+/_install/

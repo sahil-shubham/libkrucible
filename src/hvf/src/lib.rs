@@ -117,6 +117,8 @@ pub enum Error {
     VcpuSetRegister,
     VcpuSetSystemRegister(u16, u64),
     VcpuSetVtimerMask,
+    VcpuGetVtimerOffset,
+    VcpuSetVtimerOffset,
     VmCreate,
 }
 
@@ -146,6 +148,8 @@ impl Display for Error {
                 "Error setting HVF vCPU system register 0x{reg:#x} to 0x{val:#x}"
             ),
             VcpuSetVtimerMask => write!(f, "Error setting HVF vCPU vtimer mask"),
+            VcpuGetVtimerOffset => write!(f, "Error getting HVF vCPU vtimer offset"),
+            VcpuSetVtimerOffset => write!(f, "Error setting HVF vCPU vtimer offset"),
             VmCreate => write!(f, "Error creating HVF VM instance"),
         }
     }
@@ -171,6 +175,51 @@ pub fn vcpu_request_exit(vcpuid: u64) -> Result<(), Error> {
 
     if ret != HV_SUCCESS {
         Err(Error::VcpuRequestExit)
+    } else {
+        Ok(())
+    }
+}
+
+/// Advance the vCPU's virtual-timer offset (`CNTVOFF_EL2`) by `delta_ns`,
+/// compensating for the physical counter that kept advancing while the vCPU was
+/// paused. The guest virtual counter is `physical_counter - offset`, so growing
+/// the offset by the paused interval gives the guest "freeze" semantics — its
+/// clock does not jump forward by the pause duration on resume. A no-op when
+/// `delta_ns == 0` (e.g. the initial boot resume).
+pub fn vcpu_adjust_vtimer_offset(vcpuid: u64, delta_ns: u64) -> Result<(), Error> {
+    if delta_ns == 0 {
+        return Ok(());
+    }
+
+    // hv_vcpu_get/set_vtimer_offset works with CNTVOFF_EL2 in raw counter ticks,
+    // so convert nanoseconds to ticks via the host timer frequency (CNTFRQ_EL0).
+    // The `mrs` only assembles on aarch64; the hvf crate is an unconditional
+    // dependency compiled on non-arm64 hosts too (where this fn is never called),
+    // so gate the asm to keep the build portable.
+    let cntfrq: u64;
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        core::arch::asm!("mrs {}, cntfrq_el0", out(reg) cntfrq)
+    };
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        cntfrq = 0;
+    }
+
+    let mut offset = 0_u64;
+    let ret = unsafe { hv_vcpu_get_vtimer_offset(vcpuid, &mut offset) };
+    if ret != HV_SUCCESS {
+        return Err(Error::VcpuGetVtimerOffset);
+    }
+
+    let delta_ticks = ((delta_ns as u128) * (cntfrq as u128) / 1_000_000_000)
+        .try_into()
+        .unwrap_or(u64::MAX);
+    let new_offset = offset.saturating_add(delta_ticks);
+
+    let ret = unsafe { hv_vcpu_set_vtimer_offset(vcpuid, new_offset) };
+    if ret != HV_SUCCESS {
+        Err(Error::VcpuSetVtimerOffset)
     } else {
         Ok(())
     }

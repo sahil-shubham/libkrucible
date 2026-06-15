@@ -63,6 +63,13 @@ impl PerCPUInterruptControllerState {
     fn get_pending_irq(&mut self) -> u32 {
         self.pending_irqs.pop_front().unwrap_or(GIC_INTID_SPURIOUS)
     }
+
+    fn wake(&mut self) {
+        if let Some(wfe_sender) = self.wfe_sender.as_ref() {
+            let _ = wfe_sender.send(self.vcpuid as u32);
+        }
+        self.status = VcpuStatus::Running;
+    }
 }
 
 pub struct VcpuList {
@@ -109,6 +116,15 @@ impl VcpuList {
     pub fn register(&self, vcpuid: u64, wfe_sender: Sender<u32>) {
         assert!(vcpuid < self.cpu_count);
         self.vcpus[vcpuid as usize].lock().unwrap().wfe_sender = Some(wfe_sender);
+    }
+
+    // Warm tier: break a WFE-parked vCPU out of its WaitForEvent recv() (without
+    // raising a guest IRQ) so it loops back and notices a pending control event.
+    // Paired with hvf::vcpu_request_exit — which kicks a vCPU blocked inside
+    // hv_vcpu_run instead — in VcpuHandle::send_event.
+    pub fn wake(&self, vcpuid: u64) {
+        assert!(vcpuid < self.cpu_count);
+        self.vcpus[vcpuid as usize].lock().unwrap().wake();
     }
 }
 

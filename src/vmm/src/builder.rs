@@ -1000,6 +1000,8 @@ pub fn build_microvm(
         mmio_device_manager,
         #[cfg(target_arch = "x86_64")]
         pio_device_manager,
+        run_state: super::VmmRunState::Running,
+        paused_at: None,
     };
 
     // Set raw mode for FDs that are connected to legacy serial devices.

@@ -906,6 +906,30 @@ int32_t krun_get_shutdown_eventfd(uint32_t ctx_id);
 int32_t krun_set_console_output(uint32_t ctx_id, const char *c_filepath);
 
 /**
+ * Sets the path of a Unix domain socket the VMM will serve after build, before
+ * the event loop, on a background thread. The wire protocol is one
+ * newline-terminated command per connection, replied to with one
+ * newline-terminated line:
+ *
+ *   PAUSE   -> OK paused | ERR <reason>
+ *   RESUME  -> OK running | ERR <reason>
+ *   STATUS  -> OK <state>   (state is one of running/paused/pausing/resuming)
+ *
+ * The connection closes after the reply. Calls are forwarded to the running
+ * VMM; brief lock contention with the main event loop is expected.
+ *
+ * Must be called before krun_start_enter().
+ *
+ * Arguments:
+ *  "ctx_id"        - the configuration context ID.
+ *  "c_socket_path" - null-terminated path for the UDS the VMM should bind.
+ *
+ * Returns:
+ *  Zero on success or a negative error number on failure.
+ */
+int32_t krun_set_control_socket(uint32_t ctx_id, const char *c_socket_path);
+
+/**
  * Configures uid which is set right before the microVM is started.
  *
  * This is useful for example when you want to access host block devices
