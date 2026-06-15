@@ -315,6 +315,22 @@ impl<'a> DescriptorChain<'a> {
     }
 }
 
+/// Serializable snapshot of a [`Queue`]'s per-run state (the config the guest
+/// driver established plus the mid-stream ring positions), for checkpoint /
+/// restore. See [`Queue::save_state`].
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct QueueState {
+    pub size: u16,
+    pub ready: bool,
+    pub desc_table: u64,
+    pub avail_ring: u64,
+    pub used_ring: u64,
+    pub next_avail: u16,
+    pub next_used: u16,
+    pub event_idx_enabled: bool,
+    pub num_added: u16,
+}
+
 #[derive(Debug, Eq, PartialEq)]
 /// A virtio queue's parameters.
 pub struct Queue {
@@ -362,6 +378,44 @@ impl Queue {
             event_idx_enabled: false,
             num_added: Wrapping(0),
         }
+    }
+
+    /// Capture the queue's per-run configuration + position for a checkpoint.
+    /// The mid-stream next_avail/next_used indices must survive so a restored
+    /// device neither re-processes nor drops in-flight descriptor chains.
+    pub fn save_state(&self) -> QueueState {
+        QueueState {
+            size: self.size,
+            ready: self.ready,
+            desc_table: self.desc_table.raw_value(),
+            avail_ring: self.avail_ring.raw_value(),
+            used_ring: self.used_ring.raw_value(),
+            next_avail: self.next_avail.0,
+            next_used: self.next_used.0,
+            event_idx_enabled: self.event_idx_enabled,
+            num_added: self.num_added.0,
+        }
+    }
+
+    /// Re-apply a [`QueueState`] captured by [`Self::save_state`] onto a freshly
+    /// built queue of the same device (rejecting a size past the device max).
+    pub fn restore_state(&mut self, state: &QueueState) -> Result<(), String> {
+        if state.size > self.max_size {
+            return Err(format!(
+                "queue snapshot size {} exceeds device max_size {}",
+                state.size, self.max_size
+            ));
+        }
+        self.size = state.size;
+        self.ready = state.ready;
+        self.desc_table = GuestAddress(state.desc_table);
+        self.avail_ring = GuestAddress(state.avail_ring);
+        self.used_ring = GuestAddress(state.used_ring);
+        self.next_avail = Wrapping(state.next_avail);
+        self.next_used = Wrapping(state.next_used);
+        self.event_idx_enabled = state.event_idx_enabled;
+        self.num_added = Wrapping(state.num_added);
+        Ok(())
     }
 
     pub fn get_max_size(&self) -> u16 {
