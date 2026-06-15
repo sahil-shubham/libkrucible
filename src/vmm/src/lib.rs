@@ -18,6 +18,8 @@ pub mod builder;
 pub(crate) mod device_manager;
 /// Resource store for configured microVM resources.
 pub mod resources;
+/// Guest-memory snapshot serialization (cold-to-disk).
+pub mod snapshot;
 /// Signal handling utilities.
 #[cfg(target_os = "linux")]
 pub mod signal_handler;
