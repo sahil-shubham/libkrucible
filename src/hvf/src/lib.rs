@@ -225,6 +225,474 @@ pub fn vcpu_adjust_vtimer_offset(vcpuid: u64, delta_ns: u64) -> Result<(), Error
     }
 }
 
+// ---------------------------------------------------------------------------
+// vCPU + GIC state capture/restore (cold-to-disk snapshot / cross-process fork).
+// A restored VM is a fresh hv_vm/hv_vcpu, so guest-visible vCPU registers, the
+// per-vCPU GIC (redistributor + CPU interface), the global GIC distributor, and
+// the virtual-timer offset must all be re-applied or the guest faults / hangs.
+// ---------------------------------------------------------------------------
+
+/// Captured aarch64 vCPU register state for HVF checkpoint/restore — the macOS
+/// analogue of KVM's `VcpuState`. Holds the general-purpose registers, program
+/// state, NEON/FP registers, the writable EL1 system registers that define guest
+/// execution + MMU state, this vCPU's GIC redistributor + CPU-interface (ICC)
+/// registers, and the virtual-timer offset. Read-only ID registers, EL2
+/// (VMM-managed) state, and debug breakpoints are intentionally excluded.
+#[derive(Clone, Debug)]
+pub struct HvfVcpuState {
+    /// X0..X30.
+    pub gp: [u64; 31],
+    /// Program counter.
+    pub pc: u64,
+    /// Processor state (CPSR/PSTATE).
+    pub cpsr: u64,
+    /// FP control register.
+    pub fpcr: u64,
+    /// FP status register.
+    pub fpsr: u64,
+    /// NEON/FP registers Q0..Q31 (128-bit each).
+    pub simd: [u128; 32],
+    /// Writable EL1 system registers as (hv_sys_reg_t, value) pairs.
+    pub sys: Vec<(u16, u64)>,
+    /// This vCPU's GIC redistributor registers (SGI/PPI group/enable/priority/
+    /// config) as (hv_gic_redistributor_reg_t, value) pairs.
+    pub gic_redist: Vec<(u32, u64)>,
+    /// This vCPU's GIC CPU-interface (ICC) registers. Without these the restored
+    /// vCPU's interrupt interface is in reset state and the guest is never woken
+    /// from WFI by a device IRQ.
+    pub gic_icc: Vec<(u32, u64)>,
+    /// Virtual-timer offset (`CNTVOFF`, raw counter ticks): `virtual_counter =
+    /// physical_counter - offset`. A fresh restored vCPU has an unrelated default
+    /// offset, so this is restored absolutely or the guest clock jumps and
+    /// time-based guest code wedges.
+    pub vtimer_offset: u64,
+}
+
+/// GIC redistributor registers captured per-vCPU (offsets == `hv_gic_redistributor_reg_t`).
+/// Config (group/priority/cfg) is restored before the set-enable register.
+#[cfg(target_arch = "aarch64")]
+const GIC_REDIST_REGS: &[u32] = &[
+    65664, // GICR_IGROUPR0
+    66560, 66564, 66568, 66572, 66576, 66580, 66584, 66588, // GICR_IPRIORITYR0..7
+    68608, 68612, // GICR_ICFGR0..1
+    65792, // GICR_ISENABLER0  (enable LAST)
+];
+
+/// GIC CPU-interface (ICC) registers captured per-vCPU (values == `hv_gic_icc_reg_t`).
+/// SRE first (enables sysreg access), group-enables last.
+#[cfg(target_arch = "aarch64")]
+const GIC_ICC_REGS: &[u32] = &[
+    50789, // ICC_SRE_EL1   (first)
+    49712, // ICC_PMR_EL1
+    50755, // ICC_BPR0_EL1
+    50787, // ICC_BPR1_EL1
+    50756, // ICC_AP0R0_EL1
+    50760, // ICC_AP1R0_EL1
+    50788, // ICC_CTLR_EL1
+    50790, // ICC_IGRPEN0_EL1 (enable LAST)
+    50791, // ICC_IGRPEN1_EL1 (enable LAST)
+];
+
+/// Runtime-resolved GIC register accessors. The Hypervisor framework does not
+/// export the `hv_gic_*` symbols for static linking on this platform (arm64
+/// chained fixups would fail to bind them at dylib load), so they are looked up
+/// via the existing `HVF` dlopen handle at runtime.
+#[cfg(target_arch = "aarch64")]
+struct GicRegBindings {
+    get_dist: libloading::Symbol<'static, unsafe extern "C" fn(u16, *mut u64) -> hv_return_t>,
+    set_dist: libloading::Symbol<'static, unsafe extern "C" fn(u16, u64) -> hv_return_t>,
+    get_redist:
+        libloading::Symbol<'static, unsafe extern "C" fn(u64, u32, *mut u64) -> hv_return_t>,
+    set_redist: libloading::Symbol<'static, unsafe extern "C" fn(u64, u32, u64) -> hv_return_t>,
+    get_icc: libloading::Symbol<'static, unsafe extern "C" fn(u64, u16, *mut u64) -> hv_return_t>,
+    set_icc: libloading::Symbol<'static, unsafe extern "C" fn(u64, u16, u64) -> hv_return_t>,
+}
+
+#[cfg(target_arch = "aarch64")]
+static GIC_REGS: LazyLock<GicRegBindings> = LazyLock::new(|| unsafe {
+    GicRegBindings {
+        get_dist: HVF
+            .get(b"hv_gic_get_distributor_reg")
+            .expect("hv_gic_get_distributor_reg"),
+        set_dist: HVF
+            .get(b"hv_gic_set_distributor_reg")
+            .expect("hv_gic_set_distributor_reg"),
+        get_redist: HVF
+            .get(b"hv_gic_get_redistributor_reg")
+            .expect("hv_gic_get_redistributor_reg"),
+        set_redist: HVF
+            .get(b"hv_gic_set_redistributor_reg")
+            .expect("hv_gic_set_redistributor_reg"),
+        get_icc: HVF.get(b"hv_gic_get_icc_reg").expect("hv_gic_get_icc_reg"),
+        set_icc: HVF.get(b"hv_gic_set_icc_reg").expect("hv_gic_set_icc_reg"),
+    }
+});
+
+impl HvfVcpuState {
+    /// Serialize to a self-describing little-endian byte blob. No cross-version
+    /// compatibility promised.
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        for &g in &self.gp {
+            out.extend_from_slice(&g.to_le_bytes());
+        }
+        out.extend_from_slice(&self.pc.to_le_bytes());
+        out.extend_from_slice(&self.cpsr.to_le_bytes());
+        out.extend_from_slice(&self.fpcr.to_le_bytes());
+        out.extend_from_slice(&self.fpsr.to_le_bytes());
+        for &q in &self.simd {
+            out.extend_from_slice(&q.to_le_bytes());
+        }
+        out.extend_from_slice(&(self.sys.len() as u32).to_le_bytes());
+        for &(reg, val) in &self.sys {
+            out.extend_from_slice(&reg.to_le_bytes());
+            out.extend_from_slice(&val.to_le_bytes());
+        }
+        out.extend_from_slice(&(self.gic_redist.len() as u32).to_le_bytes());
+        for &(reg, val) in &self.gic_redist {
+            out.extend_from_slice(&reg.to_le_bytes());
+            out.extend_from_slice(&val.to_le_bytes());
+        }
+        out.extend_from_slice(&(self.gic_icc.len() as u32).to_le_bytes());
+        for &(reg, val) in &self.gic_icc {
+            out.extend_from_slice(&reg.to_le_bytes());
+            out.extend_from_slice(&val.to_le_bytes());
+        }
+        out.extend_from_slice(&self.vtimer_offset.to_le_bytes());
+        out
+    }
+
+    /// Reconstruct from a blob produced by [`Self::serialize`].
+    pub fn deserialize(bytes: &[u8]) -> std::result::Result<HvfVcpuState, String> {
+        let mut pos = 0usize;
+        let take = |b: &[u8], pos: &mut usize, n: usize| -> std::result::Result<Vec<u8>, String> {
+            if *pos + n > b.len() {
+                return Err("HvfVcpuState blob truncated".to_string());
+            }
+            let s = b[*pos..*pos + n].to_vec();
+            *pos += n;
+            Ok(s)
+        };
+        let u64_at = |b: &[u8], pos: &mut usize| -> std::result::Result<u64, String> {
+            Ok(u64::from_le_bytes(take(b, pos, 8)?.try_into().unwrap()))
+        };
+        let mut gp = [0u64; 31];
+        for slot in gp.iter_mut() {
+            *slot = u64_at(bytes, &mut pos)?;
+        }
+        let pc = u64_at(bytes, &mut pos)?;
+        let cpsr = u64_at(bytes, &mut pos)?;
+        let fpcr = u64_at(bytes, &mut pos)?;
+        let fpsr = u64_at(bytes, &mut pos)?;
+        let mut simd = [0u128; 32];
+        for slot in simd.iter_mut() {
+            *slot = u128::from_le_bytes(take(bytes, &mut pos, 16)?.try_into().unwrap());
+        }
+        let n = u32::from_le_bytes(take(bytes, &mut pos, 4)?.try_into().unwrap()) as usize;
+        let mut sys = Vec::with_capacity(n);
+        for _ in 0..n {
+            let reg = u16::from_le_bytes(take(bytes, &mut pos, 2)?.try_into().unwrap());
+            let val = u64_at(bytes, &mut pos)?;
+            sys.push((reg, val));
+        }
+        let read_u32_pairs =
+            |bytes: &[u8], pos: &mut usize| -> std::result::Result<Vec<(u32, u64)>, String> {
+                let n = u32::from_le_bytes(take(bytes, pos, 4)?.try_into().unwrap()) as usize;
+                let mut v = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let reg = u32::from_le_bytes(take(bytes, pos, 4)?.try_into().unwrap());
+                    let val = u64::from_le_bytes(take(bytes, pos, 8)?.try_into().unwrap());
+                    v.push((reg, val));
+                }
+                Ok(v)
+            };
+        let gic_redist = read_u32_pairs(bytes, &mut pos)?;
+        let gic_icc = read_u32_pairs(bytes, &mut pos)?;
+        let vtimer_offset = if pos < bytes.len() {
+            u64_at(bytes, &mut pos)?
+        } else {
+            0
+        };
+        Ok(HvfVcpuState {
+            gp,
+            pc,
+            cpsr,
+            fpcr,
+            fpsr,
+            simd,
+            sys,
+            gic_redist,
+            gic_icc,
+            vtimer_offset,
+        })
+    }
+}
+
+/// The writable EL1 system registers captured/restored for a faithful guest
+/// state snapshot (MMU config, exception state, thread pointers, timer arm,
+/// pointer-auth keys).
+#[cfg(target_arch = "aarch64")]
+const SNAPSHOT_SYS_REGS: &[u16] = &[
+    hv_sys_reg_t_HV_SYS_REG_SP_EL0,
+    hv_sys_reg_t_HV_SYS_REG_SP_EL1,
+    hv_sys_reg_t_HV_SYS_REG_ELR_EL1,
+    hv_sys_reg_t_HV_SYS_REG_SPSR_EL1,
+    hv_sys_reg_t_HV_SYS_REG_SCTLR_EL1,
+    hv_sys_reg_t_HV_SYS_REG_TCR_EL1,
+    hv_sys_reg_t_HV_SYS_REG_TTBR0_EL1,
+    hv_sys_reg_t_HV_SYS_REG_TTBR1_EL1,
+    hv_sys_reg_t_HV_SYS_REG_MAIR_EL1,
+    hv_sys_reg_t_HV_SYS_REG_AMAIR_EL1,
+    hv_sys_reg_t_HV_SYS_REG_VBAR_EL1,
+    hv_sys_reg_t_HV_SYS_REG_CONTEXTIDR_EL1,
+    hv_sys_reg_t_HV_SYS_REG_TPIDR_EL0,
+    hv_sys_reg_t_HV_SYS_REG_TPIDR_EL1,
+    hv_sys_reg_t_HV_SYS_REG_TPIDRRO_EL0,
+    hv_sys_reg_t_HV_SYS_REG_CPACR_EL1,
+    hv_sys_reg_t_HV_SYS_REG_AFSR0_EL1,
+    hv_sys_reg_t_HV_SYS_REG_AFSR1_EL1,
+    hv_sys_reg_t_HV_SYS_REG_ESR_EL1,
+    hv_sys_reg_t_HV_SYS_REG_FAR_EL1,
+    hv_sys_reg_t_HV_SYS_REG_PAR_EL1,
+    hv_sys_reg_t_HV_SYS_REG_CSSELR_EL1,
+    hv_sys_reg_t_HV_SYS_REG_ACTLR_EL1,
+    hv_sys_reg_t_HV_SYS_REG_MDSCR_EL1,
+    // Virtual-timer compare + control: a fresh restored vCPU's timer regs are at
+    // reset, so the guest's per-CPU scheduler tick (armed via CNTV_CVAL_EL0 +
+    // CNTV_CTL_EL0) would never fire after resume — the guest services device
+    // IRQs but never schedules userspace. CVAL before CTL so the compare is set
+    // before the timer is (re-)enabled.
+    hv_sys_reg_t_HV_SYS_REG_CNTKCTL_EL1,
+    hv_sys_reg_t_HV_SYS_REG_CNTV_CVAL_EL0,
+    hv_sys_reg_t_HV_SYS_REG_CNTV_CTL_EL0,
+    // Pointer-authentication keys (per-boot secrets). The guest signs return
+    // addresses with these; if a restored vCPU has different keys the first
+    // authentication faults (FPAC) and the kernel panics. Capture + restore so
+    // signed pointers remain valid.
+    hv_sys_reg_t_HV_SYS_REG_APIAKEYLO_EL1,
+    hv_sys_reg_t_HV_SYS_REG_APIAKEYHI_EL1,
+    hv_sys_reg_t_HV_SYS_REG_APIBKEYLO_EL1,
+    hv_sys_reg_t_HV_SYS_REG_APIBKEYHI_EL1,
+    hv_sys_reg_t_HV_SYS_REG_APDAKEYLO_EL1,
+    hv_sys_reg_t_HV_SYS_REG_APDAKEYHI_EL1,
+    hv_sys_reg_t_HV_SYS_REG_APDBKEYLO_EL1,
+    hv_sys_reg_t_HV_SYS_REG_APDBKEYHI_EL1,
+    hv_sys_reg_t_HV_SYS_REG_APGAKEYLO_EL1,
+    hv_sys_reg_t_HV_SYS_REG_APGAKEYHI_EL1,
+];
+
+/// Capture the full register state of a (paused) HVF vCPU by its id. Must run on
+/// the owning vCPU thread (the GIC reads are per-vCPU); the macOS analogue of
+/// KVM's `Vcpu::save_state`.
+#[cfg(target_arch = "aarch64")]
+pub fn vcpu_save_state(vcpuid: u64) -> Result<HvfVcpuState, Error> {
+    let mut gp = [0u64; 31];
+    for (i, slot) in gp.iter_mut().enumerate() {
+        let mut v = 0u64;
+        let ret = unsafe { hv_vcpu_get_reg(vcpuid, hv_reg_t_HV_REG_X0 + i as u32, &mut v) };
+        if ret != HV_SUCCESS {
+            return Err(Error::VcpuReadRegister);
+        }
+        *slot = v;
+    }
+    let read_reg = |reg: u32| -> Result<u64, Error> {
+        let mut v = 0u64;
+        let ret = unsafe { hv_vcpu_get_reg(vcpuid, reg, &mut v) };
+        if ret != HV_SUCCESS {
+            Err(Error::VcpuReadRegister)
+        } else {
+            Ok(v)
+        }
+    };
+    let pc = read_reg(hv_reg_t_HV_REG_PC)?;
+    let cpsr = read_reg(hv_reg_t_HV_REG_CPSR)?;
+    let fpcr = read_reg(hv_reg_t_HV_REG_FPCR)?;
+    let fpsr = read_reg(hv_reg_t_HV_REG_FPSR)?;
+
+    let mut simd = [0u128; 32];
+    for (i, slot) in simd.iter_mut().enumerate() {
+        let mut v: hv_simd_fp_uchar16_t = 0;
+        let ret = unsafe {
+            hv_vcpu_get_simd_fp_reg(vcpuid, hv_simd_fp_reg_t_HV_SIMD_FP_REG_Q0 + i as u32, &mut v)
+        };
+        if ret != HV_SUCCESS {
+            return Err(Error::VcpuReadRegister);
+        }
+        *slot = v;
+    }
+
+    let mut sys = Vec::with_capacity(SNAPSHOT_SYS_REGS.len());
+    for &reg in SNAPSHOT_SYS_REGS {
+        let mut v = 0u64;
+        let ret = unsafe { hv_vcpu_get_sys_reg(vcpuid, reg, &mut v) };
+        if ret != HV_SUCCESS {
+            return Err(Error::VcpuReadSystemRegister);
+        }
+        sys.push((reg, v));
+    }
+
+    // Per-vCPU GIC state: redistributor (SGI/PPI) + CPU interface (ICC).
+    let mut gic_redist = Vec::with_capacity(GIC_REDIST_REGS.len());
+    for &reg in GIC_REDIST_REGS {
+        let mut v = 0u64;
+        let ret = unsafe { (GIC_REGS.get_redist)(vcpuid, reg, &mut v) };
+        if ret != HV_SUCCESS {
+            return Err(Error::VcpuReadSystemRegister);
+        }
+        gic_redist.push((reg, v));
+    }
+    let mut gic_icc = Vec::with_capacity(GIC_ICC_REGS.len());
+    for &reg in GIC_ICC_REGS {
+        let mut v = 0u64;
+        let ret = unsafe { (GIC_REGS.get_icc)(vcpuid, reg as u16, &mut v) };
+        if ret != HV_SUCCESS {
+            return Err(Error::VcpuReadSystemRegister);
+        }
+        gic_icc.push((reg, v));
+    }
+
+    let mut vtimer_offset = 0u64;
+    let ret = unsafe { hv_vcpu_get_vtimer_offset(vcpuid, &mut vtimer_offset) };
+    if ret != HV_SUCCESS {
+        return Err(Error::VcpuGetVtimerOffset);
+    }
+
+    Ok(HvfVcpuState {
+        gp,
+        pc,
+        cpsr,
+        fpcr,
+        fpsr,
+        simd,
+        sys,
+        gic_redist,
+        gic_icc,
+        vtimer_offset,
+    })
+}
+
+/// Restore previously-captured register state onto a (paused) HVF vCPU by its
+/// id. Must run on the owning vCPU thread; the macOS analogue of KVM's
+/// `Vcpu::restore_state`.
+#[cfg(target_arch = "aarch64")]
+pub fn vcpu_restore_state(vcpuid: u64, state: &HvfVcpuState) -> Result<(), Error> {
+    // System registers first (MMU/exception config), then GP/PC/PSTATE/SIMD.
+    for &(reg, val) in &state.sys {
+        let ret = unsafe { hv_vcpu_set_sys_reg(vcpuid, reg, val) };
+        if ret != HV_SUCCESS {
+            return Err(Error::VcpuSetSystemRegister(reg, val));
+        }
+    }
+    let write_reg = |reg: u32, val: u64| -> Result<(), Error> {
+        let ret = unsafe { hv_vcpu_set_reg(vcpuid, reg, val) };
+        if ret != HV_SUCCESS {
+            Err(Error::VcpuSetRegister)
+        } else {
+            Ok(())
+        }
+    };
+    for (i, &v) in state.gp.iter().enumerate() {
+        write_reg(hv_reg_t_HV_REG_X0 + i as u32, v)?;
+    }
+    write_reg(hv_reg_t_HV_REG_PC, state.pc)?;
+    write_reg(hv_reg_t_HV_REG_CPSR, state.cpsr)?;
+    write_reg(hv_reg_t_HV_REG_FPCR, state.fpcr)?;
+    write_reg(hv_reg_t_HV_REG_FPSR, state.fpsr)?;
+    for (i, &v) in state.simd.iter().enumerate() {
+        let ret = unsafe {
+            hv_vcpu_set_simd_fp_reg(vcpuid, hv_simd_fp_reg_t_HV_SIMD_FP_REG_Q0 + i as u32, v)
+        };
+        if ret != HV_SUCCESS {
+            return Err(Error::VcpuSetRegister);
+        }
+    }
+    // Per-vCPU GIC state, replayed in captured order (config before enable).
+    for &(reg, val) in &state.gic_redist {
+        let ret = unsafe { (GIC_REGS.set_redist)(vcpuid, reg, val) };
+        if ret != HV_SUCCESS {
+            return Err(Error::VcpuSetSystemRegister(0, val));
+        }
+    }
+    for &(reg, val) in &state.gic_icc {
+        let ret = unsafe { (GIC_REGS.set_icc)(vcpuid, reg as u16, val) };
+        if ret != HV_SUCCESS {
+            return Err(Error::VcpuSetSystemRegister(0, val));
+        }
+    }
+    // Set the vtimer offset absolutely (not the delta nudge) so a fresh restored
+    // vCPU's guest virtual counter continues from the snapshot.
+    let ret = unsafe { hv_vcpu_set_vtimer_offset(vcpuid, state.vtimer_offset) };
+    if ret != HV_SUCCESS {
+        return Err(Error::VcpuSetVtimerOffset);
+    }
+    Ok(())
+}
+
+/// Capture the global GIC distributor state (interrupt group/priority/config,
+/// SPI routing, set-enables). Returns (reg-offset, value) pairs;
+/// `gic_restore_distributor` replays them with `GICD_CTLR` written last. The
+/// distributor is global (not per-vCPU), so this may run on any thread.
+#[cfg(target_arch = "aarch64")]
+pub fn gic_save_distributor() -> Result<Vec<(u32, u64)>, Error> {
+    // GICD_TYPER (offset 4): ITLinesNumber[4:0] => num_irqs = 32*(n+1). Reading
+    // per-IRQ registers beyond the implemented range faults HVF.
+    let mut typer = 0u64;
+    let ret = unsafe { (GIC_REGS.get_dist)(4, &mut typer) };
+    if ret != HV_SUCCESS {
+        return Err(Error::VcpuReadSystemRegister);
+    }
+    let num_irqs = 32 * (((typer & 0x1f) as u32) + 1);
+
+    let mut regs = Vec::new();
+    for reg in gic_distributor_regs(num_irqs) {
+        let mut v = 0u64;
+        let ret = unsafe { (GIC_REGS.get_dist)(reg as u16, &mut v) };
+        // Skip registers the GIC rejects rather than aborting the whole save.
+        if ret == HV_SUCCESS {
+            regs.push((reg, v));
+        }
+    }
+    Ok(regs)
+}
+
+/// Restore distributor state captured by [`gic_save_distributor`]. Config /
+/// routing / enable registers first, then `GICD_CTLR` (offset 0) last so the
+/// distributor is only enabled once its configuration is in place.
+#[cfg(target_arch = "aarch64")]
+pub fn gic_restore_distributor(regs: &[(u32, u64)]) -> Result<(), Error> {
+    for &(reg, val) in regs.iter().filter(|(r, _)| *r != 0) {
+        let ret = unsafe { (GIC_REGS.set_dist)(reg as u16, val) };
+        if ret != HV_SUCCESS {
+            return Err(Error::VcpuSetSystemRegister(0, val));
+        }
+    }
+    if let Some(&(_, ctlr)) = regs.iter().find(|(r, _)| *r == 0) {
+        let ret = unsafe { (GIC_REGS.set_dist)(0, ctlr) };
+        if ret != HV_SUCCESS {
+            return Err(Error::VcpuSetSystemRegister(0, ctlr));
+        }
+    }
+    Ok(())
+}
+
+/// GIC distributor register offsets to snapshot (offset == `hv_gic_distributor_reg_t`),
+/// bounded to the `num_irqs` the GIC implements (per-IRQ ranges past that fault):
+/// GICD_CTLR, IGROUPR, IPRIORITYR, ICFGR, IROUTER (64-bit SPI routing, SPIs 32+),
+/// ISENABLER. Read-only (TYPER/PIDR2) and clear/transient registers are excluded.
+#[cfg(target_arch = "aarch64")]
+fn gic_distributor_regs(num_irqs: u32) -> Vec<u32> {
+    let n32 = num_irqs / 32; // 1 bit per IRQ  (IGROUPR / ISENABLER)
+    let n4 = num_irqs / 4; //   8 bits per IRQ (IPRIORITYR)
+    let n16 = num_irqs / 16; //  2 bits per IRQ (ICFGR)
+    let mut regs = vec![0u32]; // GICD_CTLR
+    regs.extend((0..n32).map(|i| 0x80 + i * 4)); // IGROUPR
+    regs.extend((0..n4).map(|i| 0x400 + i * 4)); // IPRIORITYR
+    regs.extend((0..n16).map(|i| 0xC00 + i * 4)); // ICFGR
+    regs.extend((32..num_irqs).map(|i| 0x6000 + i * 8)); // IROUTER (SPIs only, 64-bit)
+    regs.extend((0..n32).map(|i| 0x100 + i * 4)); // ISENABLER
+    regs
+}
+
 pub fn vcpu_set_pending_irq(
     vcpuid: u64,
     irq_type: InterruptType,
@@ -776,5 +1244,54 @@ impl HvfVcpu<'_> {
             }
             _ => panic!("unexpected exception: 0x{ec:x}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::HvfVcpuState;
+
+    // The captured vCPU state is serialized into the on-disk checkpoint blob and
+    // read back on restore; a byte-roundtrip must be lossless across every field
+    // (GP/PC/PSTATE/SIMD, the variable-length sysreg + GIC pair lists, and the
+    // vtimer offset).
+    #[test]
+    fn hvf_vcpu_state_serialize_roundtrip() {
+        let mut gp = [0u64; 31];
+        for (i, g) in gp.iter_mut().enumerate() {
+            *g = 0x1000 + i as u64;
+        }
+        let mut simd = [0u128; 32];
+        for (i, q) in simd.iter_mut().enumerate() {
+            *q = (i as u128) << 64 | 0xDEAD_BEEF;
+        }
+        let state = HvfVcpuState {
+            gp,
+            pc: 0xffff_0000_1234,
+            cpsr: 0x3c5,
+            fpcr: 0x0,
+            fpsr: 0x10,
+            simd,
+            sys: vec![(0x1234, 0xabcd), (0x5, 0x9999_9999)],
+            gic_redist: vec![(65664, 1), (65792, 0xff)],
+            gic_icc: vec![(50789, 7)],
+            vtimer_offset: 0xdead_beef_cafe,
+        };
+        let blob = state.serialize();
+        let got = HvfVcpuState::deserialize(&blob).expect("deserialize");
+        assert_eq!(got.gp, state.gp);
+        assert_eq!(got.pc, state.pc);
+        assert_eq!(got.cpsr, state.cpsr);
+        assert_eq!(got.simd, state.simd);
+        assert_eq!(got.sys, state.sys);
+        assert_eq!(got.gic_redist, state.gic_redist);
+        assert_eq!(got.gic_icc, state.gic_icc);
+        assert_eq!(got.vtimer_offset, state.vtimer_offset);
+    }
+
+    #[test]
+    fn hvf_vcpu_state_truncated_blob_errors() {
+        let blob = vec![0u8; 10]; // far shorter than the fixed GP/PC/... prefix
+        assert!(HvfVcpuState::deserialize(&blob).is_err());
     }
 }
