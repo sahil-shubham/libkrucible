@@ -1806,14 +1806,18 @@ pub unsafe extern "C" fn krun_set_control_socket(
 /// one newline-terminated reply out, then close. Returns the reply string.
 #[cfg(unix)]
 fn control_handle(mut stream: UnixStream, vmm: &Arc<Mutex<vmm::Vmm>>) {
-    let mut buf = [0u8; 64];
+    // Big enough for a SNAPSHOT command with a long directory path.
+    let mut buf = [0u8; 4096];
     let n = match stream.read(&mut buf) {
         Ok(n) if n > 0 => n,
         _ => return,
     };
-    let cmd = String::from_utf8_lossy(&buf[..n])
-        .trim()
-        .to_ascii_uppercase();
+    let line = String::from_utf8_lossy(&buf[..n]);
+    let line = line.trim();
+    let (cmd, arg) = match line.split_once(char::is_whitespace) {
+        Some((c, a)) => (c.to_ascii_uppercase(), a.trim()),
+        None => (line.to_ascii_uppercase(), ""),
+    };
     let reply = match cmd.as_str() {
         "PAUSE" => match vmm.lock().unwrap().pause() {
             Ok(()) => "OK paused\n".to_string(),
@@ -1827,9 +1831,62 @@ fn control_handle(mut stream: UnixStream, vmm: &Arc<Mutex<vmm::Vmm>>) {
             let s = vmm.lock().unwrap().run_state();
             format!("OK {}\n", s.as_str())
         }
+        // SNAPSHOT <dir>: cold-to-disk. Writes a self-contained bundle
+        // (memory.img + checkpoint.bin + manifest.json) and leaves the VM
+        // paused (the caller exits the helper to free RAM, or RESUMEs).
+        "SNAPSHOT" => handle_snapshot(vmm, arg),
         other => format!("ERR unknown command: {other}\n"),
     };
     let _ = stream.write_all(reply.as_bytes());
+}
+
+/// Write a self-contained cold-to-disk snapshot bundle to `dir`. macOS/HVF only.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn handle_snapshot(vmm: &Arc<Mutex<vmm::Vmm>>, dir: &str) -> String {
+    use std::io::Write as _;
+    if dir.is_empty() {
+        return "ERR snapshot: missing <dir>\n".to_string();
+    }
+    if let Err(e) = std::fs::create_dir_all(dir) {
+        return format!("ERR snapshot: create dir {dir}: {e}\n");
+    }
+    let mem_path = format!("{dir}/memory.img");
+    let mut mem_file = match std::fs::File::create(&mem_path) {
+        Ok(f) => std::io::BufWriter::new(f),
+        Err(e) => return format!("ERR snapshot: create {mem_path}: {e}\n"),
+    };
+    let (checkpoint, mem_descs) = match vmm.lock().unwrap().checkpoint(&mut mem_file) {
+        Ok(v) => v,
+        Err(e) => return format!("ERR snapshot: checkpoint: {e}\n"),
+    };
+    if let Err(e) = mem_file.flush().and_then(|_| mem_file.get_ref().sync_all()) {
+        return format!("ERR snapshot: flush memory.img: {e}\n");
+    }
+    // checkpoint.bin: VM + vCPU + device state (not RAM).
+    if let Err(e) = std::fs::write(format!("{dir}/checkpoint.bin"), checkpoint.serialize()) {
+        return format!("ERR snapshot: write checkpoint.bin: {e}\n");
+    }
+    // manifest.json: the refuse-or-restore gate + memory layout. Hand-rolled to
+    // avoid a serde dep in this crate.
+    let mem_json: Vec<String> = mem_descs
+        .iter()
+        .map(|d| format!("{{\"gpa\":{},\"len\":{}}}", d.gpa, d.len))
+        .collect();
+    let manifest = format!(
+        "{{\"proto_ver\":1,\"arch\":\"aarch64\",\"vcpu_count\":{},\"mem\":[{}]}}\n",
+        checkpoint.vcpu_states.len(),
+        mem_json.join(",")
+    );
+    if let Err(e) = std::fs::write(format!("{dir}/manifest.json"), manifest) {
+        return format!("ERR snapshot: write manifest.json: {e}\n");
+    }
+    let bytes: u64 = mem_descs.iter().map(|d| d.len).sum();
+    format!("OK snapshotted {dir} ({bytes} bytes, paused)\n")
+}
+
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+fn handle_snapshot(_vmm: &Arc<Mutex<vmm::Vmm>>, _dir: &str) -> String {
+    "ERR snapshot not supported on this platform\n".to_string()
 }
 
 /// Spawn the control-socket listener thread. Idempotent on remove of a stale
