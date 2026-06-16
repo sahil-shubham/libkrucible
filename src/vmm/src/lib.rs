@@ -233,6 +233,16 @@ pub struct VmCheckpoint {
     pub devices: devices::virtio::persist::VmDevicesState,
 }
 
+/// Magic at the head of `checkpoint.bin` ("KRUCSNAP", little-endian). Guards
+/// against restoring a truncated, garbage, or wrong-format file: a clean refuse
+/// instead of a confusing deserialize panic deep in a section parse.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub const CHECKPOINT_MAGIC: u64 = 0x4b5255_4353_4e4150; // "KRUCSNAP"
+/// On-disk checkpoint format version. Bumped on any layout change — there is no
+/// cross-version compatibility (the manifest's proto_ver mirrors this).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub const CHECKPOINT_VERSION: u32 = 1;
+
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl VmCheckpoint {
     pub fn serialize(&self) -> Vec<u8> {
@@ -241,6 +251,8 @@ impl VmCheckpoint {
             out.extend_from_slice(b);
         }
         let mut out = Vec::new();
+        out.extend_from_slice(&CHECKPOINT_MAGIC.to_le_bytes());
+        out.extend_from_slice(&CHECKPOINT_VERSION.to_le_bytes());
         put(&mut out, &self.vm_state.serialize());
         out.extend_from_slice(&(self.vcpu_states.len() as u32).to_le_bytes());
         for v in &self.vcpu_states {
@@ -265,6 +277,21 @@ impl VmCheckpoint {
             Ok(s)
         }
         let mut pos = 0usize;
+        // Header: magic + version, before any section.
+        if bytes.len() < 12 {
+            return Err("checkpoint truncated (header)".to_string());
+        }
+        let magic = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
+        if magic != CHECKPOINT_MAGIC {
+            return Err(format!("bad checkpoint magic {magic:#x} (not a krucible checkpoint)"));
+        }
+        let ver = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
+        if ver != CHECKPOINT_VERSION {
+            return Err(format!(
+                "checkpoint version {ver} != {CHECKPOINT_VERSION} (incompatible — re-snapshot)"
+            ));
+        }
+        pos = 12;
         let vm_state = vstate::VmState::deserialize(take(bytes, &mut pos)?)?;
         if pos + 4 > bytes.len() {
             return Err("checkpoint truncated (vcpu count)".to_string());
