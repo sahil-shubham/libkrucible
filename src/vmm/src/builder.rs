@@ -585,6 +585,9 @@ pub fn build_microvm(
     event_manager: &mut EventManager,
     _shutdown_efd: Option<EventFd>,
     _sender: Sender<WorkerMessage>,
+    // Cold restore: start the vCPUs paused (don't cold-boot) so the caller can
+    // load the snapshot's RAM + register/device state and resume. macOS/HVF.
+    _restoring: bool,
 ) -> std::result::Result<Arc<Mutex<Vmm>>, StartMicrovmError> {
     let payload = choose_payload(vm_resources)?;
 
@@ -1163,6 +1166,15 @@ pub fn build_microvm(
         println!("Starting TEE/microVM.");
     }
 
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    if _restoring {
+        vmm.start_vcpus_paused(vcpus)
+            .map_err(StartMicrovmError::Internal)?;
+    } else {
+        vmm.start_vcpus(vcpus)
+            .map_err(StartMicrovmError::Internal)?;
+    }
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
     vmm.start_vcpus(vcpus)
         .map_err(StartMicrovmError::Internal)?;
 

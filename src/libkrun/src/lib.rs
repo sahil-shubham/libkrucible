@@ -191,6 +191,10 @@ struct ContextConfig {
     /// Path of the UDS the control thread serves (PAUSE/RESUME/STATUS). None
     /// (default) means no control thread is started.
     control_socket_path: Option<PathBuf>,
+    /// Cold restore: directory of a snapshot bundle (memory.img + checkpoint.bin
+    /// + manifest.json). When set, the VM is restored from it instead of cold
+    /// booting. Set by krun_set_snapshot.
+    snapshot_dir: Option<PathBuf>,
     vmm_uid: Option<libc::uid_t>,
     vmm_gid: Option<libc::gid_t>,
     #[cfg(all(
@@ -1802,6 +1806,28 @@ pub unsafe extern "C" fn krun_set_control_socket(
     }
 }
 
+/// Set the snapshot-bundle directory to cold-restore from. When set, the next
+/// krun_start_enter restores the VM from <dir> (memory.img + checkpoint.bin)
+/// instead of cold-booting, resuming the guest from the snapshot point. Must be
+/// called before krun_start_enter. macOS/HVF only.
+#[allow(clippy::missing_safety_doc)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn krun_set_snapshot(ctx_id: u32, c_snapshot_dir: *const c_char) -> i32 {
+    unsafe {
+        let dir = match CStr::from_ptr(c_snapshot_dir).to_str() {
+            Ok(p) => p,
+            Err(_) => return -libc::EINVAL,
+        };
+        match CTX_MAP.lock().unwrap().entry(ctx_id) {
+            Entry::Occupied(mut ctx_cfg) => {
+                ctx_cfg.get_mut().snapshot_dir = Some(PathBuf::from(dir));
+                KRUN_SUCCESS
+            }
+            Entry::Vacant(_) => -libc::ENOENT,
+        }
+    }
+}
+
 /// Serve a single control-socket connection: one newline-terminated command in,
 /// one newline-terminated reply out, then close. Returns the reply string.
 #[cfg(unix)]
@@ -3094,11 +3120,36 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
 
     let (sender, _receiver) = unbounded();
 
+    // Cold restore: load the checkpoint (VM/vCPU/device state) from the bundle
+    // before building so the vCPUs start paused; the guest RAM is streamed in
+    // after build (restore_and_resume). macOS/HVF only.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let restore = match ctx_cfg.snapshot_dir.take() {
+        Some(dir) => {
+            let cp_path = dir.join("checkpoint.bin");
+            match std::fs::read(&cp_path).map_err(|e| e.to_string()).and_then(|b| {
+                vmm::VmCheckpoint::deserialize(&b)
+            }) {
+                Ok(cp) => Some((cp, dir.join("memory.img"))),
+                Err(e) => {
+                    error!("cold restore: load {}: {e}", cp_path.display());
+                    return -libc::EINVAL;
+                }
+            }
+        }
+        None => None,
+    };
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let restoring = restore.is_some();
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    let restoring = false;
+
     let _vmm = match vmm::builder::build_microvm(
         &ctx_cfg.vmr,
         &mut event_manager,
         ctx_cfg.shutdown_efd,
         sender,
+        restoring,
     ) {
         Ok(vmm) => vmm,
         Err(e) => {
@@ -3125,6 +3176,24 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
     if let Err(e) = start_control_socket(ctx_cfg.control_socket_path.take(), _vmm.clone()) {
         error!("Failed to start control socket: {e}");
         return -libc::EINVAL;
+    }
+
+    // Cold restore: stream guest RAM into the freshly-built (paused) VM, replay
+    // VM/device/vCPU state, and resume from the snapshot point.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    if let Some((checkpoint, mem_path)) = restore {
+        let mut mem_file = match std::fs::File::open(&mem_path) {
+            Ok(f) => std::io::BufReader::new(f),
+            Err(e) => {
+                error!("cold restore: open {}: {e}", mem_path.display());
+                return -libc::EINVAL;
+            }
+        };
+        if let Err(e) = _vmm.lock().unwrap().restore_and_resume(checkpoint, &mut mem_file) {
+            error!("cold restore failed: {e}");
+            return -libc::EINVAL;
+        }
+        log::info!("cold restore: resumed from snapshot");
     }
 
     loop {

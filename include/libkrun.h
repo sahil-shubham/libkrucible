@@ -930,6 +930,23 @@ int32_t krun_set_console_output(uint32_t ctx_id, const char *c_filepath);
 int32_t krun_set_control_socket(uint32_t ctx_id, const char *c_socket_path);
 
 /**
+ * Cold-restore the VM from a snapshot bundle directory (memory.img +
+ * checkpoint.bin + manifest.json, as written by the control-socket SNAPSHOT
+ * command) instead of cold-booting. On the next krun_start_enter the guest RAM,
+ * device state, and vCPU registers are loaded from the bundle and the guest
+ * resumes from the snapshot point. Must be called before krun_start_enter().
+ * macOS/HVF only.
+ *
+ * Arguments:
+ *  "ctx_id"         - the configuration context ID.
+ *  "c_snapshot_dir" - null-terminated path of the snapshot bundle directory.
+ *
+ * Returns:
+ *  Zero on success or a negative error number on failure.
+ */
+int32_t krun_set_snapshot(uint32_t ctx_id, const char *c_snapshot_dir);
+
+/**
  * Configures uid which is set right before the microVM is started.
  *
  * This is useful for example when you want to access host block devices

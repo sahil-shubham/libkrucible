@@ -87,6 +87,19 @@ pub fn memory_image_len(descs: &[MemoryRegionDesc]) -> u64 {
     descs.iter().map(|d| d.len).sum()
 }
 
+/// The region layout of a guest memory map, in iteration (region) order. On
+/// restore the freshly-built VM has the same RAM config -> the same layout, so
+/// `memory.img` (written in this order) reads straight back without needing the
+/// descriptors stored in the bundle.
+pub fn region_descs(mem: &GuestMemoryMmap) -> Vec<MemoryRegionDesc> {
+    mem.iter()
+        .map(|r| MemoryRegionDesc {
+            gpa: r.start_addr().raw_value(),
+            len: r.len(),
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

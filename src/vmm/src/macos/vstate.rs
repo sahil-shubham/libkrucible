@@ -237,6 +237,10 @@ pub struct Vcpu {
 
     vcpu_list: Arc<VcpuList>,
     nested_enabled: bool,
+    // Cold restore: hold in the paused event loop after set_initial_state
+    // (before running the guest) so the orchestrator can apply RestoreState and
+    // then Resume — the guest then runs from the restored PC, not a cold boot.
+    start_paused: bool,
 }
 
 impl Vcpu {
@@ -330,7 +334,14 @@ impl Vcpu {
             response_sender,
             vcpu_list,
             nested_enabled,
+            start_paused: false,
         })
+    }
+
+    /// Cold restore: make this vCPU hold in the paused event loop after
+    /// set_initial_state instead of cold-booting (see [`Vcpu::run`]).
+    pub fn set_start_paused(&mut self, start_paused: bool) {
+        self.start_paused = start_paused;
     }
 
     /// Returns the cpu index as seen by the guest OS.
@@ -500,6 +511,16 @@ impl Vcpu {
         hvf_vcpu
             .set_initial_state(entry_addr, self.fdt_addr)
             .unwrap_or_else(|_| panic!("Can't set HVF vCPU {hvf_vcpuid} initial state"));
+
+        // Cold restore: hold here until the orchestrator applies the snapshot's
+        // register state (RestoreState) and resumes. set_initial_state above
+        // still programmed the VMM-managed EL2/HCR state (not part of the
+        // snapshot); RestoreState overwrites PC/PSTATE/EL1/GP/SIMD before the
+        // guest runs. A false return (channel closed) means exit.
+        if self.start_paused && !self.run_paused_loop(hvf_vcpuid) {
+            self.exit(FC_EXIT_CODE_GENERIC_ERROR);
+            return;
+        }
 
         loop {
             // Warm tier: pick up a pending control event (Pause/Resume) between

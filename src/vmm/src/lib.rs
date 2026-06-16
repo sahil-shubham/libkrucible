@@ -342,6 +342,26 @@ impl Vmm {
         Ok(())
     }
 
+    /// Cold restore: spawn the vCPU threads in the start-paused state — each
+    /// holds in its paused event loop after set_initial_state instead of
+    /// cold-booting, so the orchestrator can apply the snapshot's register state
+    /// (RestoreState) and then resume. Leaves the VM Paused.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    pub fn start_vcpus_paused(&mut self, mut vcpus: Vec<Vcpu>) -> Result<()> {
+        let vcpu_count = vcpus.len();
+        Vcpu::register_kick_signal_handler();
+        self.vcpus_handles.reserve(vcpu_count);
+        for mut vcpu in vcpus.drain(..) {
+            vcpu.set_mmio_bus(self.mmio_device_manager.bus.clone());
+            vcpu.set_start_paused(true);
+            self.vcpus_handles
+                .push(vcpu.start_threaded().map_err(Error::VcpuHandle)?);
+        }
+        self.run_state = VmmRunState::Paused;
+        self.paused_at = Some(Instant::now());
+        Ok(())
+    }
+
     /// Sends a resume command to the vcpus. `_paused_duration` is unused on
     /// Linux today (KVM guest-clock continuity on warm resume is a separate
     /// follow-up); the parameter keeps the cross-platform signature uniform.
@@ -619,6 +639,32 @@ impl Vmm {
             },
             mem_descs,
         ))
+    }
+
+    /// Cold restore (eager): load guest RAM from `mem_in` into the freshly-built
+    /// guest memory (same RAM config -> same region layout as the snapshot),
+    /// re-apply VM + device + vCPU state, then resume from the restored PC. The
+    /// vCPUs must have been started paused ([`Self::start_vcpus_paused`]).
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    pub fn restore_and_resume<R: std::io::Read>(
+        &mut self,
+        checkpoint: VmCheckpoint,
+        mem_in: &mut R,
+    ) -> Result<()> {
+        let descs = snapshot::region_descs(&self.guest_memory);
+        snapshot::read_guest_memory_into(&self.guest_memory, &descs, mem_in)
+            .map_err(|e| Error::Snapshot(format!("guest-memory load: {e}")))?;
+        self.vm
+            .restore_state(&checkpoint.vm_state)
+            .map_err(Error::Vm)?;
+        self.restore_activate_devices(&checkpoint.devices)?;
+        self.restore_vcpu_states(checkpoint.vcpu_states)?;
+        // Resume with paused_ns=0: the absolute CNTVOFF was already restored by
+        // vcpu_restore_state, so no warm-tier delta nudge is wanted here.
+        self.resume_vcpus(Duration::ZERO)?;
+        self.run_state = VmmRunState::Running;
+        self.paused_at = None;
+        Ok(())
     }
 
     /// Configures the system for boot.

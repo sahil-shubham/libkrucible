@@ -275,7 +275,9 @@ const GIC_REDIST_REGS: &[u32] = &[
     65664, // GICR_IGROUPR0
     66560, 66564, 66568, 66572, 66576, 66580, 66584, 66588, // GICR_IPRIORITYR0..7
     68608, 68612, // GICR_ICFGR0..1
-    65792, // GICR_ISENABLER0  (enable LAST)
+    65792, // GICR_ISENABLER0  (enable before pend/active)
+    66048, // GICR_ISPENDR0    (pending SGI/PPI)
+    66304, // GICR_ISACTIVER0  (active SGI/PPI — so a mid-ISR vtimer EOIs cleanly)
 ];
 
 /// GIC CPU-interface (ICC) registers captured per-vCPU (values == `hv_gic_icc_reg_t`).
@@ -681,7 +683,7 @@ pub fn gic_restore_distributor(regs: &[(u32, u64)]) -> Result<(), Error> {
 /// ISENABLER. Read-only (TYPER/PIDR2) and clear/transient registers are excluded.
 #[cfg(target_arch = "aarch64")]
 fn gic_distributor_regs(num_irqs: u32) -> Vec<u32> {
-    let n32 = num_irqs / 32; // 1 bit per IRQ  (IGROUPR / ISENABLER)
+    let n32 = num_irqs / 32; // 1 bit per IRQ  (IGROUPR / ISENABLER / IS{PEND,ACTIVE}R)
     let n4 = num_irqs / 4; //   8 bits per IRQ (IPRIORITYR)
     let n16 = num_irqs / 16; //  2 bits per IRQ (ICFGR)
     let mut regs = vec![0u32]; // GICD_CTLR
@@ -689,7 +691,12 @@ fn gic_distributor_regs(num_irqs: u32) -> Vec<u32> {
     regs.extend((0..n4).map(|i| 0x400 + i * 4)); // IPRIORITYR
     regs.extend((0..n16).map(|i| 0xC00 + i * 4)); // ICFGR
     regs.extend((32..num_irqs).map(|i| 0x6000 + i * 8)); // IROUTER (SPIs only, 64-bit)
-    regs.extend((0..n32).map(|i| 0x100 + i * 4)); // ISENABLER
+    regs.extend((0..n32).map(|i| 0x100 + i * 4)); // ISENABLER (enable before pend/active)
+    // Pending + active per-IRQ state: captured so a guest paused mid-ISR (an SPI
+    // active in the GIC) restores with that interrupt still active and EOIs it
+    // cleanly instead of trapping "no active virtual interrupt".
+    regs.extend((0..n32).map(|i| 0x200 + i * 4)); // ISPENDR
+    regs.extend((0..n32).map(|i| 0x300 + i * 4)); // ISACTIVER
     regs
 }
 
