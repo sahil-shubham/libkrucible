@@ -3066,8 +3066,25 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
         return -libc::EINVAL;
     }
 
+    // A root block device with no bundled init (krucible builds without
+    // init-blob, so /init.krun = lohar runs as PID 1 directly): the kernel must
+    // mount the block root itself. Swap the virtiofs root for an ext4 block root
+    // in the cmdline (lohar then runs from /dev/vda). Requires virtio-blk + ext4
+    // built in to the bundled kernel (nomodule). See PLAN-krucible-cold-tier.md.
+    #[cfg(feature = "blk")]
+    let is_block_root = ctx_cfg.root_block_cfg.is_some();
+    #[cfg(not(feature = "blk"))]
+    let is_block_root = false;
+    let prolog = if is_block_root {
+        format!(
+            "reboot=k panic=-1 panic_print=0 nomodule console=hvc0 \
+             root=/dev/vda rootfstype=ext4 rw quiet no-kvmapf init={INIT_PATH}"
+        )
+    } else {
+        format!("{DEFAULT_KERNEL_CMDLINE} init={INIT_PATH}")
+    };
     let kernel_cmdline = KernelCmdlineConfig {
-        prolog: Some(format!("{DEFAULT_KERNEL_CMDLINE} init={INIT_PATH}")),
+        prolog: Some(prolog),
         krun_env: Some(format!(
             " {} {} {} {} {}",
             ctx_cfg.get_exec_path(),
