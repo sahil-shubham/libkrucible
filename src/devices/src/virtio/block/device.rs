@@ -234,7 +234,10 @@ pub struct Block {
     cache_type: CacheType,
     disk_image: Arc<Mutex<SyncFormatAccess<Box<dyn DynStorage>>>>,
     disk_image_id: Vec<u8>,
-    worker_thread: Option<JoinHandle<()>>,
+    worker_thread: Option<JoinHandle<BlockWorker>>,
+    // A worker reclaimed by quiesce_for_snapshot (stopped, queues drained) so
+    // its virtqueue position can be read for a checkpoint / re-armed after.
+    quiesced_worker: Option<BlockWorker>,
     worker_stopfd: EventFd,
 
     // Virtio fields.
@@ -353,6 +356,7 @@ impl Block {
             acked_features: 0u64,
             device_state: DeviceState::Inactive,
             worker_thread: None,
+            quiesced_worker: None,
             worker_stopfd: EventFd::new(EFD_NONBLOCK)?,
         })
     }
@@ -370,6 +374,63 @@ impl Block {
     /// Specifies if this block device is read only.
     pub fn is_read_only(&self) -> bool {
         self.avail_features & (1u64 << VIRTIO_BLK_F_RO) != 0
+    }
+}
+
+/// Snapshot of the virtio-block device's runtime state for a VM checkpoint.
+/// The disk data lives in the backing image on disk (already consistent at a
+/// quiesced checkpoint), so only the negotiated features, activation, the
+/// image id, and the drained virtqueue position are captured.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct BlockState {
+    pub acked_features: u64,
+    pub activated: bool,
+    pub disk_image_id: Vec<u8>,
+    /// Virtqueue position, captured after the worker is drained
+    /// (quiesce_for_snapshot). `None` if not activated/quiesced at snapshot time.
+    pub queue: Option<crate::virtio::queue::QueueState>,
+}
+
+impl Block {
+    /// Stop + reclaim the worker so its virtqueue index sits at a clean boundary
+    /// for save_state. Idempotent; the VM is vCPU-paused when this runs.
+    fn quiesce_worker(&mut self) {
+        if let Some(handle) = self.worker_thread.take() {
+            let _ = self.worker_stopfd.write(1);
+            match handle.join() {
+                Ok(worker) => self.quiesced_worker = Some(worker),
+                Err(e) => error!("block: error draining worker thread: {e:?}"),
+            }
+        }
+    }
+
+    /// Restart a reclaimed worker (after an in-process checkpoint).
+    fn rearm_worker(&mut self) {
+        if let Some(worker) = self.quiesced_worker.take() {
+            self.worker_thread = Some(worker.run());
+        }
+    }
+
+    /// Capture device state for a checkpoint. The worker must be quiesced first
+    /// (quiesce_for_snapshot) so the queue position is at a clean boundary.
+    pub fn save_state(&self) -> BlockState {
+        BlockState {
+            acked_features: self.acked_features,
+            activated: matches!(self.device_state, DeviceState::Activated(..)),
+            disk_image_id: self.disk_image_id.clone(),
+            queue: self.quiesced_worker.as_ref().map(|w| w.save_queue_state()),
+        }
+    }
+
+    /// Restore device state onto a freshly-built device. Sets negotiated
+    /// features; the queue position is re-applied to the worker on re-activation
+    /// (the device manager rebuilds the queue from the saved QueueState).
+    pub fn restore_state(&mut self, state: &BlockState) -> std::result::Result<(), String> {
+        self.acked_features = state.acked_features;
+        if let (Some(worker), Some(qs)) = (self.quiesced_worker.as_mut(), state.queue.as_ref()) {
+            worker.restore_queue_state(qs)?;
+        }
+        Ok(())
     }
 }
 
@@ -465,7 +526,27 @@ impl VirtioDevice for Block {
                 error!("error waiting for worker thread: {e:?}");
             }
         }
+        self.quiesced_worker = None;
         self.device_state = DeviceState::Inactive;
         true
+    }
+
+    fn quiesce_for_snapshot(&mut self) {
+        self.quiesce_worker();
+        // Force buffered writes durable so the checkpoint's backing image is
+        // consistent (a cold snapshot frees the VM; the image must stand alone).
+        if self.cache_type == CacheType::Writeback {
+            let img = self.disk_image.lock().unwrap();
+            if img.flush().is_err() {
+                error!("block: failed to flush before snapshot");
+            }
+            if img.sync().is_err() {
+                error!("block: failed to sync before snapshot");
+            }
+        }
+    }
+
+    fn rearm_after_snapshot(&mut self) {
+        self.rearm_worker();
     }
 }

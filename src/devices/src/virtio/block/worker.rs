@@ -83,14 +83,28 @@ impl BlockWorker {
         }
     }
 
-    pub fn run(self) -> thread::JoinHandle<()> {
+    pub fn run(self) -> thread::JoinHandle<BlockWorker> {
         thread::Builder::new()
             .name("block worker".into())
             .spawn(|| self.work())
             .unwrap()
     }
 
-    fn work(mut self) {
+    /// Capture this worker's virtqueue position for a checkpoint. Valid once the
+    /// worker is drained (reclaimed via the device's quiesce_for_snapshot).
+    pub fn save_queue_state(&self) -> crate::virtio::queue::QueueState {
+        self.device_queue.queue.save_state()
+    }
+
+    /// Re-apply a captured virtqueue position onto this (reclaimed) worker.
+    pub fn restore_queue_state(
+        &mut self,
+        state: &crate::virtio::queue::QueueState,
+    ) -> Result<(), String> {
+        self.device_queue.queue.restore_state(state)
+    }
+
+    fn work(mut self) -> BlockWorker {
         let virtq_ev_fd = self.device_queue.event.as_raw_fd();
         let stop_ev_fd = self.stop_fd.as_raw_fd();
 
@@ -122,7 +136,9 @@ impl BlockWorker {
                             EventSet::IN if source == stop_ev_fd => {
                                 debug!("stopping worker thread");
                                 let _ = self.stop_fd.read();
-                                return;
+                                // Hand ourselves back so the device can read the
+                                // drained queue position (checkpoint) or restart.
+                                return self;
                             }
                             _ => {
                                 log::warn!(

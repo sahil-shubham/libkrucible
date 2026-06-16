@@ -164,6 +164,23 @@ pub trait VirtioDevice: AsAny + Send {
     fn shm_region(&self) -> Option<&VirtioShmRegion> {
         None
     }
+
+    /// Cold-tier snapshot hook: drain/reclaim any worker thread so the device's
+    /// virtqueue indices sit at a clean boundary and can be read by save_state.
+    /// The VM is already vCPU-paused when this is called. No-op for devices
+    /// whose queues are shared (e.g. vsock) or that have no worker. Pair with
+    /// rearm_after_snapshot to resume after an in-process checkpoint (a cold
+    /// snapshot just exits the process, so rearm is unnecessary there).
+    fn quiesce_for_snapshot(&mut self) {}
+
+    /// Undo quiesce_for_snapshot: restart the reclaimed worker so the live VM
+    /// continues after an in-process checkpoint.
+    fn rearm_after_snapshot(&mut self) {}
+
+    /// Restore hook called after the device is re-activated on a fresh VM, once
+    /// its worker/queues are live. Lets a device finish applying state captured
+    /// by save_state that needs the activated context. No-op by default.
+    fn finish_restore_activation(&mut self) {}
 }
 
 pub trait VmmExitObserver: Send {
