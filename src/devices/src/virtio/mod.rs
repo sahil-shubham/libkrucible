@@ -32,6 +32,9 @@ mod mmio;
 #[cfg(feature = "net")]
 pub mod net;
 mod queue;
+pub use self::queue::QueueState;
+/// Device-state aggregation for VM checkpoint/restore (cold tier).
+pub mod persist;
 #[cfg(not(feature = "tee"))]
 pub mod rng;
 #[cfg(feature = "vhost-user")]
@@ -41,7 +44,7 @@ pub mod vsock;
 #[cfg(not(feature = "tee"))]
 pub use self::balloon::*;
 #[cfg(feature = "blk")]
-pub use self::block::{Block, CacheType};
+pub use self::block::{Block, BlockState, CacheType};
 pub use self::console::*;
 pub use self::device::*;
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]

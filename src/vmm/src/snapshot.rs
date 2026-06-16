@@ -147,6 +147,51 @@ mod tests {
         assert_eq!(got_hi, vec![0xCD; 0x8000]);
     }
 
+    // The aggregated device state is serialized into the on-disk checkpoint and
+    // read back on restore; the JSON roundtrip must be lossless across device
+    // variants, their negotiated features, and per-queue ring positions.
+    #[test]
+    fn test_device_state_roundtrip() {
+        use devices::virtio::persist::{DeviceSnapshot, VmDevicesState};
+        use devices::virtio::QueueState;
+        use devices::virtio::{ConsoleState, RngState, VsockState};
+
+        let qs = QueueState {
+            size: 256,
+            ready: true,
+            desc_table: 0x1000,
+            avail_ring: 0x2000,
+            used_ring: 0x3000,
+            next_avail: 42,
+            next_used: 41,
+            event_idx_enabled: true,
+            num_added: 7,
+        };
+        let state = VmDevicesState {
+            devices: vec![
+                DeviceSnapshot::Console(ConsoleState {
+                    acked_features: 0xABCD,
+                    activated: true,
+                    queues: vec![Some(qs.clone()), None],
+                }),
+                DeviceSnapshot::Vsock(VsockState {
+                    cid: 7,
+                    acked_features: 0x1234,
+                    activated: true,
+                    queue_rx: Some(qs.clone()),
+                    queue_tx: Some(qs.clone()),
+                }),
+                DeviceSnapshot::Rng(RngState {
+                    acked_features: 0x9,
+                    queue: Some(qs),
+                }),
+            ],
+        };
+        let bytes = state.to_bytes().expect("serialize");
+        let restored = VmDevicesState::from_bytes(&bytes).expect("deserialize");
+        assert_eq!(state, restored, "device state must round-trip through bytes");
+    }
+
     #[test]
     fn test_short_stream_is_an_error() {
         let size = 0x4000usize;

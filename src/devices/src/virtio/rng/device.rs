@@ -83,6 +83,35 @@ impl Rng {
     }
 }
 
+/// Snapshot of the virtio-rng device's runtime state. Entropy is stateless, so
+/// only negotiated features + the request queue position are captured.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RngState {
+    pub acked_features: u64,
+    pub queue: Option<crate::virtio::queue::QueueState>,
+}
+
+impl Rng {
+    /// Capture device state for a checkpoint. rng holds its queues directly (no
+    /// worker thread owns them), so this reads the position without quiescing.
+    pub fn save_state(&self) -> RngState {
+        RngState {
+            acked_features: self.acked_features,
+            queue: self
+                .queues
+                .as_ref()
+                .map(|q| q[REQ_INDEX].queue.save_state()),
+        }
+    }
+
+    /// Restore device state onto a freshly-built device (features; the queue
+    /// position is re-applied via the device manager's re-activation).
+    pub fn restore_state(&mut self, state: &RngState) -> std::result::Result<(), String> {
+        self.acked_features = state.acked_features;
+        Ok(())
+    }
+}
+
 impl VirtioDevice for Rng {
     fn avail_features(&self) -> u64 {
         self.avail_features

@@ -283,6 +283,44 @@ impl Console {
     }
 }
 
+/// Snapshot of the virtio-console device's runtime state. Per-queue position is
+/// captured for the queues the device still holds; a queue taken by a live port
+/// worker is `None` (an idle-agent cold snapshot has no active console I/O).
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ConsoleState {
+    pub acked_features: u64,
+    pub activated: bool,
+    pub queues: Vec<Option<crate::virtio::queue::QueueState>>,
+}
+
+impl Console {
+    /// Capture device state for a checkpoint.
+    pub fn save_state(&self) -> ConsoleState {
+        ConsoleState {
+            acked_features: self.acked_features,
+            activated: matches!(self.device_state, DeviceState::Activated(..)),
+            queues: self
+                .queues
+                .iter()
+                .map(|q| q.as_ref().map(|dq| dq.queue.save_state()))
+                .collect(),
+        }
+    }
+
+    /// Restore device state onto a freshly-built device: features, and the
+    /// position of any queue the device still holds (others are re-applied via
+    /// re-activation).
+    pub fn restore_state(&mut self, state: &ConsoleState) -> std::result::Result<(), String> {
+        self.acked_features = state.acked_features;
+        for (slot, snap) in self.queues.iter_mut().zip(state.queues.iter()) {
+            if let (Some(dq), Some(qs)) = (slot.as_mut(), snap.as_ref()) {
+                dq.queue.restore_state(qs)?;
+            }
+        }
+        Ok(())
+    }
+}
+
 impl VirtioDevice for Console {
     fn avail_features(&self) -> u64 {
         self.avail_features
