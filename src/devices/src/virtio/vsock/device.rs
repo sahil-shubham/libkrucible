@@ -180,6 +180,51 @@ impl Vsock {
     }
 }
 
+/// Snapshot of the vsock device's runtime state for VM checkpoint/restore.
+/// Live connections are NOT captured: at a quiescent checkpoint the guest has
+/// no in-flight vsock traffic, and the host reconnects on demand after restore
+/// (the agent re-dials the bridged UDS). `cid` is captured for completeness but
+/// is left as constructed on restore (matching on a plain restore).
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct VsockState {
+    pub cid: u64,
+    pub acked_features: u64,
+    pub activated: bool,
+    pub queue_rx: Option<super::super::queue::QueueState>,
+    pub queue_tx: Option<super::super::queue::QueueState>,
+}
+
+impl Vsock {
+    /// Capture this vsock device's runtime state for a VM checkpoint.
+    pub fn save_state(&self) -> VsockState {
+        let q = |slot: &Option<Arc<Mutex<VirtQueue>>>| {
+            slot.as_ref().map(|m| m.lock().unwrap().save_state())
+        };
+        VsockState {
+            cid: self.cid,
+            acked_features: self.acked_features,
+            activated: matches!(self.device_state, DeviceState::Activated(..)),
+            queue_rx: q(&self.queue_rx),
+            queue_tx: q(&self.queue_tx),
+        }
+    }
+
+    /// Restore runtime state onto a freshly-constructed, not-yet-activated vsock
+    /// device. Re-applies negotiated features and the queue ring positions; the
+    /// device is (re-)activated separately by the device manager. Connections
+    /// are not restored — the guest reconnects.
+    pub fn restore_state(&mut self, state: &VsockState) -> Result<(), String> {
+        self.acked_features = state.acked_features;
+        if let (Some(m), Some(qs)) = (self.queue_rx.as_ref(), state.queue_rx.as_ref()) {
+            m.lock().unwrap().restore_state(qs)?;
+        }
+        if let (Some(m), Some(qs)) = (self.queue_tx.as_ref(), state.queue_tx.as_ref()) {
+            m.lock().unwrap().restore_state(qs)?;
+        }
+        Ok(())
+    }
+}
+
 impl VirtioDevice for Vsock {
     fn avail_features(&self) -> u64 {
         self.avail_features
