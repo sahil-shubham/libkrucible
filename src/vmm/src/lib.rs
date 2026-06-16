@@ -132,6 +132,10 @@ pub enum Error {
     VcpuSpawn(std::io::Error),
     /// Vm error.
     Vm(vstate::Error),
+    /// Guest-memory / device checkpoint or restore failure.
+    Snapshot(String),
+    /// vCPU state capture/restore failure.
+    VcpuSnapshot(String),
     /// Error thrown by observer object on Vmm initialization.
     VmmObserverInit(utils::errno::Error),
     /// Error thrown by observer object on Vmm teardown.
@@ -165,6 +169,8 @@ impl Display for Error {
             VcpuHandle(e) => write!(f, "Cannot create a vCPU handle. {e}"),
             VcpuPause => write!(f, "vCPUs pause failed."),
             VcpuResume => write!(f, "vCPUs resume failed."),
+            Snapshot(e) => write!(f, "Snapshot error: {e}"),
+            VcpuSnapshot(e) => write!(f, "vCPU snapshot error: {e}"),
             VcpuSpawn(e) => write!(f, "Cannot spawn Vcpu thread: {e}"),
             Vm(e) => write!(f, "Vm error: {e}"),
             VmmObserverInit(e) => write!(
@@ -213,6 +219,69 @@ impl VmmRunState {
             VmmRunState::Paused => "paused",
             VmmRunState::Resuming => "resuming",
         }
+    }
+}
+
+/// The non-memory half of a VM checkpoint: VM-level state (GIC distributor),
+/// per-vCPU register state, and virtio device runtime state. Guest RAM is
+/// streamed separately (see `snapshot::write_guest_memory`). Serializes to a
+/// length-prefixed blob (`checkpoint.bin`); no cross-version compatibility.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub struct VmCheckpoint {
+    pub vm_state: vstate::VmState,
+    pub vcpu_states: Vec<vstate::VcpuState>,
+    pub devices: devices::virtio::persist::VmDevicesState,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl VmCheckpoint {
+    pub fn serialize(&self) -> Vec<u8> {
+        fn put(out: &mut Vec<u8>, b: &[u8]) {
+            out.extend_from_slice(&(b.len() as u32).to_le_bytes());
+            out.extend_from_slice(b);
+        }
+        let mut out = Vec::new();
+        put(&mut out, &self.vm_state.serialize());
+        out.extend_from_slice(&(self.vcpu_states.len() as u32).to_le_bytes());
+        for v in &self.vcpu_states {
+            put(&mut out, &v.serialize());
+        }
+        put(&mut out, &self.devices.to_bytes().unwrap_or_default());
+        out
+    }
+
+    pub fn deserialize(bytes: &[u8]) -> std::result::Result<VmCheckpoint, String> {
+        fn take<'a>(b: &'a [u8], pos: &mut usize) -> std::result::Result<&'a [u8], String> {
+            if *pos + 4 > b.len() {
+                return Err("checkpoint truncated (length header)".to_string());
+            }
+            let len = u32::from_le_bytes(b[*pos..*pos + 4].try_into().unwrap()) as usize;
+            *pos += 4;
+            if *pos + len > b.len() {
+                return Err("checkpoint truncated (section)".to_string());
+            }
+            let s = &b[*pos..*pos + len];
+            *pos += len;
+            Ok(s)
+        }
+        let mut pos = 0usize;
+        let vm_state = vstate::VmState::deserialize(take(bytes, &mut pos)?)?;
+        if pos + 4 > bytes.len() {
+            return Err("checkpoint truncated (vcpu count)".to_string());
+        }
+        let n = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
+        pos += 4;
+        let mut vcpu_states = Vec::with_capacity(n);
+        for _ in 0..n {
+            vcpu_states.push(vstate::VcpuState::deserialize(take(bytes, &mut pos)?)?);
+        }
+        let devices =
+            devices::virtio::persist::VmDevicesState::from_bytes(take(bytes, &mut pos)?)?;
+        Ok(VmCheckpoint {
+            vm_state,
+            vcpu_states,
+            devices,
+        })
     }
 }
 
@@ -400,6 +469,156 @@ impl Vmm {
             }
             VmmRunState::Resuming => Err(Error::VcpuResume),
         }
+    }
+
+    // --- Cold tier: checkpoint / restore (macOS/HVF) ---------------------
+
+    /// Capture every snapshot-supporting device's runtime state. Quiesce the
+    /// device workers first so virtqueue indices are at a clean boundary.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    pub fn snapshot_devices(&self) -> devices::virtio::persist::VmDevicesState {
+        self.mmio_device_manager.snapshot_devices()
+    }
+
+    /// Drain + reclaim each device's worker before snapshot/restore.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    pub fn quiesce_devices(&self) {
+        self.mmio_device_manager.quiesce_devices();
+    }
+
+    /// Restart workers quiesced by [`Self::quiesce_devices`] (in-process).
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    pub fn rearm_devices(&self) {
+        self.mmio_device_manager.rearm_devices();
+    }
+
+    /// Re-activate devices on a freshly-built VM from a checkpoint (cold restore).
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    pub fn restore_activate_devices(
+        &self,
+        state: &devices::virtio::persist::VmDevicesState,
+    ) -> Result<()> {
+        self.mmio_device_manager
+            .restore_activate_devices(state)
+            .map_err(Error::Snapshot)
+    }
+
+    /// Capture every (paused) vCPU's register state. Runs on each vCPU thread
+    /// via the SaveState event (the only safe point for HVF register reads).
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    pub fn save_vcpu_states(&mut self) -> Result<Vec<vstate::VcpuState>> {
+        if self.run_state != VmmRunState::Paused {
+            return Err(Error::VcpuSnapshot(
+                "vCPUs must be paused before capturing state".to_string(),
+            ));
+        }
+        for handle in self.vcpus_handles.iter() {
+            handle
+                .send_event(vstate::VcpuEvent::SaveState)
+                .map_err(Error::VcpuEvent)?;
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut states = Vec::with_capacity(self.vcpus_handles.len());
+        for handle in self.vcpus_handles.iter() {
+            states.push(Self::wait_for_saved_state(handle, deadline)?);
+        }
+        Ok(states)
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn wait_for_saved_state(handle: &VcpuHandle, deadline: Instant) -> Result<vstate::VcpuState> {
+        loop {
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .ok_or_else(|| Error::VcpuSnapshot("timed out capturing vCPU state".to_string()))?;
+            match handle.response_receiver().recv_timeout(remaining) {
+                Ok(VcpuResponse::SavedState(state)) => return Ok(*state),
+                Ok(VcpuResponse::Exited(_)) => {
+                    return Err(Error::VcpuSnapshot("vCPU exited during capture".to_string()))
+                }
+                Ok(_) => {}
+                Err(_) => {
+                    return Err(Error::VcpuSnapshot(
+                        "channel closed while capturing vCPU state".to_string(),
+                    ))
+                }
+            }
+        }
+    }
+
+    /// Wait (until `deadline`) for a vCPU to ack the `expected` response. Matches
+    /// by enum discriminant so payload-carrying responses (SavedState) compare.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn wait_for_vcpu_response(
+        handle: &VcpuHandle,
+        expected: VcpuResponse,
+        deadline: Instant,
+    ) -> Result<()> {
+        loop {
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .ok_or(Error::VcpuPause)?;
+            match handle.response_receiver().recv_timeout(remaining) {
+                Ok(response)
+                    if std::mem::discriminant(&response) == std::mem::discriminant(&expected) =>
+                {
+                    return Ok(())
+                }
+                Ok(VcpuResponse::Exited(_)) => return Err(Error::VcpuPause),
+                Ok(_) => {}
+                Err(_) => return Err(Error::VcpuPause),
+            }
+        }
+    }
+
+    /// Re-apply captured register state onto the (paused) restored vCPUs.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    pub fn restore_vcpu_states(&mut self, states: Vec<vstate::VcpuState>) -> Result<()> {
+        if states.len() != self.vcpus_handles.len() {
+            return Err(Error::VcpuSnapshot(format!(
+                "vCPU state count {} does not match vCPU count {}",
+                states.len(),
+                self.vcpus_handles.len()
+            )));
+        }
+        for (handle, state) in self.vcpus_handles.iter().zip(states) {
+            handle
+                .send_event(vstate::VcpuEvent::RestoreState(Box::new(state)))
+                .map_err(Error::VcpuEvent)?;
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        for handle in self.vcpus_handles.iter() {
+            Self::wait_for_vcpu_response(handle, VcpuResponse::RestoredState, deadline)
+                .map_err(|_| Error::VcpuSnapshot("vCPU restore not acknowledged".to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// Cold-to-disk checkpoint: pause, quiesce devices, capture VM/vCPU/device
+    /// state, and stream guest RAM eagerly to `mem_out`. Leaves the VM paused
+    /// with workers re-armed (the caller exits the process to free RAM, or
+    /// resumes). Returns the checkpoint + the memory region layout.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    pub fn checkpoint<W: std::io::Write>(
+        &mut self,
+        mem_out: &mut W,
+    ) -> Result<(VmCheckpoint, Vec<snapshot::MemoryRegionDesc>)> {
+        self.pause()?;
+        self.quiesce_devices();
+        let vcpu_states = self.save_vcpu_states()?;
+        let vm_state = self.vm.save_state().map_err(Error::Vm)?;
+        let devices = self.snapshot_devices();
+        let mem_descs = snapshot::write_guest_memory(&self.guest_memory, mem_out)
+            .map_err(|e| Error::Snapshot(format!("guest-memory dump: {e}")))?;
+        self.rearm_devices();
+        Ok((
+            VmCheckpoint {
+                vm_state,
+                vcpu_states,
+                devices,
+            },
+            mem_descs,
+        ))
     }
 
     /// Configures the system for boot.

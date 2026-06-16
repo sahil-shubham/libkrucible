@@ -320,6 +320,39 @@ impl MmioTransport {
             .expect("Failed to activate device");
     }
 
+    /// Cold-tier restore: re-activate this device on a freshly-built VM from a
+    /// saved checkpoint, bypassing the guest's MMIO init handshake. Sets the
+    /// negotiated features, rebuilds the queues from their saved `QueueState`s
+    /// (config + ring positions), marks the transport fully-initialized, and
+    /// activates. The caller restores device-level state (e.g. fs FUSE maps)
+    /// before this so `activate` rebuilds the worker from it.
+    pub fn restore_and_activate(
+        &mut self,
+        queue_states: &[Option<super::queue::QueueState>],
+        acked_features: u64,
+    ) -> std::result::Result<(), String> {
+        self.locked_device().set_acked_features(acked_features);
+
+        let mut queues = Self::create_queues(&self.queue_config);
+        for (i, queue) in queues.iter_mut().enumerate() {
+            if let Some(Some(qs)) = queue_states.get(i) {
+                queue.restore_state(qs)?;
+            }
+        }
+        self.queues = Some(queues);
+
+        // Mark the device as the guest would have after a full init handshake.
+        self.device_status = device_status::ACKNOWLEDGE
+            | device_status::DRIVER
+            | device_status::FEATURES_OK
+            | device_status::DRIVER_OK;
+
+        if !self.locked_device().is_activated() {
+            self.activate();
+        }
+        Ok(())
+    }
+
     /// Update device status according to the state machine defined by VirtIO Spec 1.0.
     /// Please refer to VirtIO Spec 1.0, section 2.1.1 and 3.1.1.
     ///

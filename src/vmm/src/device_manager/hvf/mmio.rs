@@ -84,6 +84,10 @@ pub struct MMIODeviceManager {
     irq: u32,
     last_irq: u32,
     id_to_dev_info: HashMap<(DeviceType, String), MMIODeviceInfo>,
+    // Side list of the virtio transports for checkpoint/restore: the bus only
+    // holds `dyn BusDevice`, so we keep the concrete transports here to iterate
+    // for snapshot/quiesce/restore (cold tier).
+    mmio_transports: Vec<Arc<Mutex<devices::virtio::MmioTransport>>>,
 }
 
 impl MMIODeviceManager {
@@ -99,7 +103,81 @@ impl MMIODeviceManager {
             last_irq: irq_interval.1,
             bus: devices::Bus::new(),
             id_to_dev_info: HashMap::new(),
+            mmio_transports: Vec::new(),
         }
+    }
+
+    /// Capture the runtime state of every snapshot-supporting virtio device for
+    /// a VM checkpoint. The caller must pause vCPUs and quiesce_devices first so
+    /// queue indices are at a clean boundary.
+    pub fn snapshot_devices(&self) -> devices::virtio::persist::VmDevicesState {
+        let mut snapshots = Vec::new();
+        for t in &self.mmio_transports {
+            let guard = t.lock().expect("poisoned transport lock");
+            if let Some(snap) = devices::virtio::persist::snapshot_device(&*guard.locked_device()) {
+                snapshots.push(snap);
+            }
+        }
+        devices::virtio::persist::VmDevicesState { devices: snapshots }
+    }
+
+    /// Quiesce every virtio device (drain+reclaim its worker) before snapshot.
+    /// Pair with [`Self::rearm_devices`].
+    pub fn quiesce_devices(&self) {
+        for t in &self.mmio_transports {
+            t.lock()
+                .expect("poisoned transport lock")
+                .locked_device()
+                .quiesce_for_snapshot();
+        }
+    }
+
+    /// Re-arm every device quiesced by [`Self::quiesce_devices`] (in-process).
+    pub fn rearm_devices(&self) {
+        for t in &self.mmio_transports {
+            t.lock()
+                .expect("poisoned transport lock")
+                .locked_device()
+                .rearm_after_snapshot();
+        }
+    }
+
+    /// Re-activate devices on a freshly-built VM from a checkpoint: for each
+    /// saved device snapshot, find a not-yet-consumed transport of the matching
+    /// device type, restore its device-level state, then re-activate it from the
+    /// saved queue state + features (bypassing the guest handshake).
+    pub fn restore_activate_devices(
+        &self,
+        state: &devices::virtio::persist::VmDevicesState,
+    ) -> std::result::Result<(), String> {
+        let mut used = vec![false; self.mmio_transports.len()];
+        for snap in &state.devices {
+            let want = snap.device_type();
+            let queue_states = snap.queue_states();
+            let acked = snap.acked_features();
+            let mut applied = false;
+            for (i, transport) in self.mmio_transports.iter().enumerate() {
+                if used[i] {
+                    continue;
+                }
+                let mut t = transport.lock().expect("poisoned transport lock");
+                if t.locked_device().device_type() != want {
+                    continue;
+                }
+                // Restore device-level state onto the not-yet-activated device
+                // first, so the subsequent activate rebuilds its worker from it.
+                devices::virtio::persist::restore_device(&mut *t.locked_device(), snap)?;
+                t.restore_and_activate(&queue_states, acked)?;
+                t.locked_device().finish_restore_activation();
+                used[i] = true;
+                applied = true;
+                break;
+            }
+            if !applied {
+                return Err(format!("no matching transport to restore device type {want}"));
+            }
+        }
+        Ok(())
     }
 
     /// Register an already created MMIO device to be used via MMIO transport.
@@ -115,8 +193,10 @@ impl MMIODeviceManager {
 
         mmio_device.set_irq_line(self.irq);
 
+        let transport = Arc::new(Mutex::new(mmio_device));
+        self.mmio_transports.push(transport.clone());
         self.bus
-            .insert(Arc::new(Mutex::new(mmio_device)), self.mmio_base, MMIO_LEN)
+            .insert(transport, self.mmio_base, MMIO_LEN)
             .map_err(Error::BusError)?;
         let ret = (self.mmio_base, self.irq);
         self.id_to_dev_info.insert(
