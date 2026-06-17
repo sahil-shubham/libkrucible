@@ -226,7 +226,7 @@ impl VmmRunState {
 /// per-vCPU register state, and virtio device runtime state. Guest RAM is
 /// streamed separately (see `snapshot::write_guest_memory`). Serializes to a
 /// length-prefixed blob (`checkpoint.bin`); no cross-version compatibility.
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(any(all(target_os = "macos", target_arch = "aarch64"), all(target_os = "linux", target_arch = "x86_64")))]
 pub struct VmCheckpoint {
     pub vm_state: vstate::VmState,
     pub vcpu_states: Vec<vstate::VcpuState>,
@@ -236,14 +236,14 @@ pub struct VmCheckpoint {
 /// Magic at the head of `checkpoint.bin` ("KRUCSNAP", little-endian). Guards
 /// against restoring a truncated, garbage, or wrong-format file: a clean refuse
 /// instead of a confusing deserialize panic deep in a section parse.
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(any(all(target_os = "macos", target_arch = "aarch64"), all(target_os = "linux", target_arch = "x86_64")))]
 pub const CHECKPOINT_MAGIC: u64 = 0x4b5255_4353_4e4150; // "KRUCSNAP"
 /// On-disk checkpoint format version. Bumped on any layout change — there is no
 /// cross-version compatibility (the manifest's proto_ver mirrors this).
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(any(all(target_os = "macos", target_arch = "aarch64"), all(target_os = "linux", target_arch = "x86_64")))]
 pub const CHECKPOINT_VERSION: u32 = 1;
 
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(any(all(target_os = "macos", target_arch = "aarch64"), all(target_os = "linux", target_arch = "x86_64")))]
 impl VmCheckpoint {
     pub fn serialize(&self) -> Vec<u8> {
         fn put(out: &mut Vec<u8>, b: &[u8]) {
@@ -373,7 +373,7 @@ impl Vmm {
     /// holds in its paused event loop after set_initial_state instead of
     /// cold-booting, so the orchestrator can apply the snapshot's register state
     /// (RestoreState) and then resume. Leaves the VM Paused.
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[cfg(any(all(target_os = "macos", target_arch = "aarch64"), all(target_os = "linux", target_arch = "x86_64")))]
     pub fn start_vcpus_paused(&mut self, mut vcpus: Vec<Vcpu>) -> Result<()> {
         let vcpu_count = vcpus.len();
         Vcpu::register_kick_signal_handler();
@@ -522,25 +522,25 @@ impl Vmm {
 
     /// Capture every snapshot-supporting device's runtime state. Quiesce the
     /// device workers first so virtqueue indices are at a clean boundary.
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[cfg(any(all(target_os = "macos", target_arch = "aarch64"), all(target_os = "linux", target_arch = "x86_64")))]
     pub fn snapshot_devices(&self) -> devices::virtio::persist::VmDevicesState {
         self.mmio_device_manager.snapshot_devices()
     }
 
     /// Drain + reclaim each device's worker before snapshot/restore.
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[cfg(any(all(target_os = "macos", target_arch = "aarch64"), all(target_os = "linux", target_arch = "x86_64")))]
     pub fn quiesce_devices(&self) {
         self.mmio_device_manager.quiesce_devices();
     }
 
     /// Restart workers quiesced by [`Self::quiesce_devices`] (in-process).
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[cfg(any(all(target_os = "macos", target_arch = "aarch64"), all(target_os = "linux", target_arch = "x86_64")))]
     pub fn rearm_devices(&self) {
         self.mmio_device_manager.rearm_devices();
     }
 
     /// Re-activate devices on a freshly-built VM from a checkpoint (cold restore).
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[cfg(any(all(target_os = "macos", target_arch = "aarch64"), all(target_os = "linux", target_arch = "x86_64")))]
     pub fn restore_activate_devices(
         &self,
         state: &devices::virtio::persist::VmDevicesState,
@@ -552,7 +552,7 @@ impl Vmm {
 
     /// Capture every (paused) vCPU's register state. Runs on each vCPU thread
     /// via the SaveState event (the only safe point for HVF register reads).
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[cfg(any(all(target_os = "macos", target_arch = "aarch64"), all(target_os = "linux", target_arch = "x86_64")))]
     pub fn save_vcpu_states(&mut self) -> Result<Vec<vstate::VcpuState>> {
         if self.run_state != VmmRunState::Paused {
             return Err(Error::VcpuSnapshot(
@@ -572,7 +572,7 @@ impl Vmm {
         Ok(states)
     }
 
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[cfg(any(all(target_os = "macos", target_arch = "aarch64"), all(target_os = "linux", target_arch = "x86_64")))]
     fn wait_for_saved_state(handle: &VcpuHandle, deadline: Instant) -> Result<vstate::VcpuState> {
         loop {
             let remaining = deadline
@@ -595,7 +595,7 @@ impl Vmm {
 
     /// Wait (until `deadline`) for a vCPU to ack the `expected` response. Matches
     /// by enum discriminant so payload-carrying responses (SavedState) compare.
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[cfg(any(all(target_os = "macos", target_arch = "aarch64"), all(target_os = "linux", target_arch = "x86_64")))]
     fn wait_for_vcpu_response(
         handle: &VcpuHandle,
         expected: VcpuResponse,
@@ -619,7 +619,7 @@ impl Vmm {
     }
 
     /// Re-apply captured register state onto the (paused) restored vCPUs.
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[cfg(any(all(target_os = "macos", target_arch = "aarch64"), all(target_os = "linux", target_arch = "x86_64")))]
     pub fn restore_vcpu_states(&mut self, states: Vec<vstate::VcpuState>) -> Result<()> {
         if states.len() != self.vcpus_handles.len() {
             return Err(Error::VcpuSnapshot(format!(
@@ -645,7 +645,7 @@ impl Vmm {
     /// state, and stream guest RAM eagerly to `mem_out`. Leaves the VM paused
     /// with workers re-armed (the caller exits the process to free RAM, or
     /// resumes). Returns the checkpoint + the memory region layout.
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[cfg(any(all(target_os = "macos", target_arch = "aarch64"), all(target_os = "linux", target_arch = "x86_64")))]
     pub fn checkpoint<W: std::io::Write>(
         &mut self,
         mem_out: &mut W,
@@ -672,7 +672,7 @@ impl Vmm {
     /// guest memory (same RAM config -> same region layout as the snapshot),
     /// re-apply VM + device + vCPU state, then resume from the restored PC. The
     /// vCPUs must have been started paused ([`Self::start_vcpus_paused`]).
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[cfg(any(all(target_os = "macos", target_arch = "aarch64"), all(target_os = "linux", target_arch = "x86_64")))]
     pub fn restore_and_resume<R: std::io::Read>(
         &mut self,
         checkpoint: VmCheckpoint,

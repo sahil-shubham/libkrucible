@@ -1166,7 +1166,10 @@ pub fn build_microvm(
         println!("Starting TEE/microVM.");
     }
 
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[cfg(any(
+        all(target_os = "macos", target_arch = "aarch64"),
+        all(target_os = "linux", target_arch = "x86_64")
+    ))]
     if _restoring {
         vmm.start_vcpus_paused(vcpus)
             .map_err(StartMicrovmError::Internal)?;
@@ -1174,7 +1177,10 @@ pub fn build_microvm(
         vmm.start_vcpus(vcpus)
             .map_err(StartMicrovmError::Internal)?;
     }
-    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    #[cfg(not(any(
+        all(target_os = "macos", target_arch = "aarch64"),
+        all(target_os = "linux", target_arch = "x86_64")
+    )))]
     vmm.start_vcpus(vcpus)
         .map_err(StartMicrovmError::Internal)?;
 

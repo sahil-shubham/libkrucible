@@ -89,6 +89,10 @@ pub struct MMIODeviceManager {
     irq: u32,
     last_irq: u32,
     id_to_dev_info: HashMap<(DeviceType, String), MMIODeviceInfo>,
+    // Registered virtio transports, kept for the cold-tier device persist
+    // (snapshot/restore). x86 only — the cold tier targets linux/x86.
+    #[cfg(target_arch = "x86_64")]
+    mmio_transports: Vec<Arc<Mutex<devices::virtio::MmioTransport>>>,
 }
 
 impl MMIODeviceManager {
@@ -103,6 +107,8 @@ impl MMIODeviceManager {
             last_irq: irq_interval.1,
             bus: devices::Bus::new(),
             id_to_dev_info: HashMap::new(),
+            #[cfg(target_arch = "x86_64")]
+            mmio_transports: Vec::new(),
         }
     }
 
@@ -149,8 +155,11 @@ impl MMIODeviceManager {
 
         mmio_device.set_irq_line(self.irq);
 
+        let transport = Arc::new(Mutex::new(mmio_device));
+        #[cfg(target_arch = "x86_64")]
+        self.mmio_transports.push(transport.clone());
         self.bus
-            .insert(Arc::new(Mutex::new(mmio_device)), self.mmio_base, MMIO_LEN)
+            .insert(transport, self.mmio_base, MMIO_LEN)
             .map_err(Error::BusError)?;
         let ret = (self.mmio_base, self.irq);
         self.id_to_dev_info.insert(
@@ -165,6 +174,79 @@ impl MMIODeviceManager {
         self.irq += 1;
 
         Ok(ret)
+    }
+
+    /// Capture the runtime state of every snapshot-supporting virtio device for
+    /// a VM checkpoint. Pause vCPUs + quiesce_devices first. (Cold tier.)
+    #[cfg(target_arch = "x86_64")]
+    pub fn snapshot_devices(&self) -> devices::virtio::persist::VmDevicesState {
+        let mut snapshots = Vec::new();
+        for t in &self.mmio_transports {
+            let guard = t.lock().expect("poisoned transport lock");
+            if let Some(snap) = devices::virtio::persist::snapshot_device(&*guard.locked_device()) {
+                snapshots.push(snap);
+            }
+        }
+        devices::virtio::persist::VmDevicesState { devices: snapshots }
+    }
+
+    /// Quiesce every virtio device (drain+reclaim its worker) before snapshot.
+    #[cfg(target_arch = "x86_64")]
+    pub fn quiesce_devices(&self) {
+        for t in &self.mmio_transports {
+            t.lock()
+                .expect("poisoned transport lock")
+                .locked_device()
+                .quiesce_for_snapshot();
+        }
+    }
+
+    /// Re-arm every device quiesced by [`Self::quiesce_devices`].
+    #[cfg(target_arch = "x86_64")]
+    pub fn rearm_devices(&self) {
+        for t in &self.mmio_transports {
+            t.lock()
+                .expect("poisoned transport lock")
+                .locked_device()
+                .rearm_after_snapshot();
+        }
+    }
+
+    /// Re-activate devices on a freshly-built VM from a checkpoint (cold
+    /// restore): match each saved snapshot to a not-yet-consumed transport of
+    /// the same device type, restore device state, re-activate from the saved
+    /// queue state + features (bypassing the guest handshake).
+    #[cfg(target_arch = "x86_64")]
+    pub fn restore_activate_devices(
+        &self,
+        state: &devices::virtio::persist::VmDevicesState,
+    ) -> std::result::Result<(), String> {
+        let mut used = vec![false; self.mmio_transports.len()];
+        for snap in &state.devices {
+            let want = snap.device_type();
+            let queue_states = snap.queue_states();
+            let acked = snap.acked_features();
+            let mut applied = false;
+            for (i, transport) in self.mmio_transports.iter().enumerate() {
+                if used[i] {
+                    continue;
+                }
+                let mut t = transport.lock().expect("poisoned transport lock");
+                if t.locked_device().device_type() != want {
+                    continue;
+                }
+                devices::virtio::persist::restore_device(&mut *t.locked_device(), snap)?;
+                t.restore_and_activate(&queue_states, acked)?;
+                t.locked_device().finish_restore_activation();
+                used[i] = true;
+                applied = true;
+                break;
+            }
+            if !applied {
+                return Err(format!("no matching transport to restore device type {want}"));
+            }
+        }
+        Ok(())
     }
 
     /// Append a registered MMIO device to the kernel cmdline.

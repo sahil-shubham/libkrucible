@@ -1190,6 +1190,12 @@ impl Vcpu {
         self.mmio_bus = Some(mmio_bus);
     }
 
+    /// No-op on Linux: the vCPU thread always enters the Paused state first (see
+    /// `run`), so cold restore starts paused for free. Kept for signature parity
+    /// with the macOS Vcpu (the cold-tier `start_vcpus_paused` calls it).
+    #[cfg(target_arch = "x86_64")]
+    pub fn set_start_paused(&mut self, _paused: bool) {}
+
     #[cfg(target_arch = "x86_64")]
     #[allow(unused_variables)]
     /// Configures a x86_64 specific vcpu and should be called once per vcpu.
