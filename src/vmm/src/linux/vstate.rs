@@ -1659,6 +1659,12 @@ impl Vcpu {
                     .send(VcpuResponse::Resumed)
                     .expect("failed to send resume status");
             }
+            // Save/restore are only valid while paused; the orchestrator always
+            // pauses first, so receiving one while running is a protocol error.
+            #[cfg(target_arch = "x86_64")]
+            Ok(VcpuEvent::SaveState | VcpuEvent::RestoreState(_)) => {
+                error!("ignoring vcpu SaveState/RestoreState received while running");
+            }
             // Unhandled exit of the other end.
             Err(TryRecvError::Disconnected) => {
                 // Move to 'exited' state.
@@ -1682,6 +1688,33 @@ impl Vcpu {
                     .expect("failed to send resume status");
                 // Move to 'running' state.
                 StateMachine::next(Self::running)
+            }
+            // Checkpoint: capture full vCPU register state while paused (the only
+            // safe point — KVM_GET_VCPU_EVENTS is unsafe while other vCPUs run).
+            #[cfg(target_arch = "x86_64")]
+            Ok(VcpuEvent::SaveState) => match self.save_state() {
+                Ok(vcpu_state) => {
+                    self.response_sender
+                        .send(VcpuResponse::SavedState(Box::new(vcpu_state)))
+                        .expect("failed to send saved vcpu state");
+                    StateMachine::next(Self::paused)
+                }
+                Err(e) => {
+                    error!("failed to capture vcpu state: {e:?}");
+                    self.exit(FC_EXIT_CODE_GENERIC_ERROR)
+                }
+            },
+            // Restore: load captured register state onto the paused vCPU.
+            #[cfg(target_arch = "x86_64")]
+            Ok(VcpuEvent::RestoreState(vcpu_state)) => {
+                if let Err(e) = self.restore_state(*vcpu_state) {
+                    error!("failed to restore vcpu state: {e:?}");
+                    return self.exit(FC_EXIT_CODE_GENERIC_ERROR);
+                }
+                self.response_sender
+                    .send(VcpuResponse::RestoredState)
+                    .expect("failed to send restored vcpu ack");
+                StateMachine::next(Self::paused)
             }
             // All other events have no effect on current 'paused' state.
             Ok(_) => StateMachine::next(Self::paused),
@@ -1756,6 +1789,131 @@ pub struct VcpuState {
     xsave: kvm_xsave,
 }
 
+// --- Binary (de)serialization for checkpoint-to-file (the cold tier) ----------
+//
+// VcpuState/VmState are raw KVM bindings: #[repr(C)] POD structs plus two
+// FAM-backed wrappers (CpuId, Msrs). kvm-bindings doesn't derive serde, so we
+// encode directly — POD fields as raw bytes, FAM wrappers as a u32 count then
+// the entries. This is the checkpoint.bin format for the linux/x86 cold tier;
+// no cross-version compatibility (the manifest carries a version).
+
+#[cfg(target_arch = "x86_64")]
+fn ser_pod<T>(out: &mut Vec<u8>, v: &T) {
+    // Safety: `T` is a #[repr(C)] POD KVM struct; reading its bytes is sound.
+    let bytes =
+        unsafe { std::slice::from_raw_parts(v as *const T as *const u8, std::mem::size_of::<T>()) };
+    out.extend_from_slice(bytes);
+}
+
+#[cfg(target_arch = "x86_64")]
+fn de_pod<T>(inp: &[u8], pos: &mut usize) -> std::result::Result<T, String> {
+    let sz = std::mem::size_of::<T>();
+    if *pos + sz > inp.len() {
+        return Err(format!(
+            "snapshot truncated: need {sz} bytes at offset {pos}, have {}",
+            inp.len()
+        ));
+    }
+    // Safety: bounds checked above; read_unaligned tolerates any alignment.
+    let v = unsafe { std::ptr::read_unaligned(inp[*pos..].as_ptr() as *const T) };
+    *pos += sz;
+    Ok(v)
+}
+
+#[cfg(target_arch = "x86_64")]
+fn ser_fam<T>(out: &mut Vec<u8>, entries: &[T]) {
+    out.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+    for e in entries {
+        ser_pod(out, e);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn de_fam<T>(inp: &[u8], pos: &mut usize) -> std::result::Result<Vec<T>, String> {
+    let count = de_pod::<u32>(inp, pos)? as usize;
+    let mut entries = Vec::with_capacity(count);
+    for _ in 0..count {
+        entries.push(de_pod::<T>(inp, pos)?);
+    }
+    Ok(entries)
+}
+
+#[cfg(target_arch = "x86_64")]
+impl VcpuState {
+    /// Serialize the full vCPU register state to a self-describing byte blob.
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        ser_fam(&mut out, self.cpuid.as_slice());
+        ser_fam(&mut out, self.msrs.as_slice());
+        ser_pod(&mut out, &self.debug_regs);
+        ser_pod(&mut out, &self.lapic);
+        ser_pod(&mut out, &self.mp_state);
+        ser_pod(&mut out, &self.regs);
+        ser_pod(&mut out, &self.sregs);
+        ser_pod(&mut out, &self.vcpu_events);
+        ser_pod(&mut out, &self.xcrs);
+        ser_pod(&mut out, &self.xsave);
+        out
+    }
+
+    /// Reconstruct a [`VcpuState`] from a blob produced by [`Self::serialize`].
+    pub fn deserialize(bytes: &[u8]) -> std::result::Result<VcpuState, String> {
+        let mut pos = 0usize;
+        let cpuid_entries: Vec<kvm_bindings::kvm_cpuid_entry2> = de_fam(bytes, &mut pos)?;
+        let msr_entries: Vec<kvm_bindings::kvm_msr_entry> = de_fam(bytes, &mut pos)?;
+        let cpuid =
+            CpuId::from_entries(&cpuid_entries).map_err(|e| format!("rebuild CpuId: {e:?}"))?;
+        let msrs = Msrs::from_entries(&msr_entries).map_err(|e| format!("rebuild Msrs: {e:?}"))?;
+        Ok(VcpuState {
+            cpuid,
+            msrs,
+            debug_regs: de_pod(bytes, &mut pos)?,
+            lapic: de_pod(bytes, &mut pos)?,
+            mp_state: de_pod(bytes, &mut pos)?,
+            regs: de_pod(bytes, &mut pos)?,
+            sregs: de_pod(bytes, &mut pos)?,
+            vcpu_events: de_pod(bytes, &mut pos)?,
+            xcrs: de_pod(bytes, &mut pos)?,
+            xsave: de_pod(bytes, &mut pos)?,
+        })
+    }
+}
+
+// VcpuState wraps raw KVM bindings that don't derive Debug; a terse manual impl
+// lets VcpuResponse derive Debug.
+#[cfg(target_arch = "x86_64")]
+impl std::fmt::Debug for VcpuState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("VcpuState { .. }")
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+impl VmState {
+    /// Serialize the VM-level KVM state (PIT, clock, PIC/IOAPIC) to a byte blob.
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        ser_pod(&mut out, &self.pitstate);
+        ser_pod(&mut out, &self.clock);
+        ser_pod(&mut out, &self.pic_master);
+        ser_pod(&mut out, &self.pic_slave);
+        ser_pod(&mut out, &self.ioapic);
+        out
+    }
+
+    /// Reconstruct a [`VmState`] from a blob produced by [`Self::serialize`].
+    pub fn deserialize(bytes: &[u8]) -> std::result::Result<VmState, String> {
+        let mut pos = 0usize;
+        Ok(VmState {
+            pitstate: de_pod(bytes, &mut pos)?,
+            clock: de_pod(bytes, &mut pos)?,
+            pic_master: de_pod(bytes, &mut pos)?,
+            pic_slave: de_pod(bytes, &mut pos)?,
+            ioapic: de_pod(bytes, &mut pos)?,
+        })
+    }
+}
+
 // Allow currently unused Pause and Exit events. These will be used by the vmm later on.
 #[allow(unused)]
 #[derive(Debug)]
@@ -1765,11 +1923,19 @@ pub enum VcpuEvent {
     Pause,
     /// Event that should resume the Vcpu.
     Resume,
-    // Serialize and Deserialize to follow after we get the support from kvm-ioctls.
+    /// Capture the full vCPU register state into a [`VcpuState`] (vCPU must be
+    /// paused). The vCPU replies with [`VcpuResponse::SavedState`].
+    #[cfg(target_arch = "x86_64")]
+    SaveState,
+    /// Restore a previously-captured [`VcpuState`] onto the (paused) vCPU. The
+    /// vCPU replies with [`VcpuResponse::RestoredState`].
+    #[cfg(target_arch = "x86_64")]
+    RestoreState(Box<VcpuState>),
 }
 
-#[derive(Debug, Eq, PartialEq)]
-/// List of responses that the Vcpu reports.
+#[derive(Debug)]
+/// List of responses that the Vcpu reports. (No Eq/PartialEq: SavedState wraps
+/// raw KVM bindings; callers match by variant / discriminant, not ==.)
 pub enum VcpuResponse {
     /// Vcpu is paused.
     Paused,
@@ -1777,6 +1943,12 @@ pub enum VcpuResponse {
     Resumed,
     /// Vcpu is stopped.
     Exited(u8),
+    /// Captured vCPU register state, in reply to [`VcpuEvent::SaveState`].
+    #[cfg(target_arch = "x86_64")]
+    SavedState(Box<VcpuState>),
+    /// Acknowledges a [`VcpuEvent::RestoreState`].
+    #[cfg(target_arch = "x86_64")]
+    RestoredState,
 }
 
 /// Wrapper over Vcpu that hides the underlying interactions with the Vcpu thread.
