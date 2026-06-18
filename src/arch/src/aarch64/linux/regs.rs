@@ -5,6 +5,7 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the THIRD-PARTY file.
 
+use std::arch::asm;
 use std::{mem, mem::offset_of, num::TryFromIntError, result};
 
 use crate::ArchMemoryInfo;
@@ -99,6 +100,42 @@ macro_rules! arm64_sys_reg {
 // Constant imported from the Linux kernel:
 // https://elixir.bootlin.com/linux/v4.20.17/source/arch/arm64/include/asm/sysreg.h#L135
 arm64_sys_reg!(MPIDR_EL1, 3, 0, 0, 0, 5);
+
+// CNTVOFF_EL2: virtual-timer counter offset (op0=3, op1=4, CRn=14, CRm=0, op2=3).
+// KVM implements the guest virtual counter as CNTVCT_EL0 = CNTPCT_EL0 - CNTVOFF_EL2.
+arm64_sys_reg!(CNTVOFF_EL2, 3, 4, 14, 0, 3);
+
+/// Warm-tier clock freeze (arm64): nudge the virtual-timer offset forward by the
+/// paused interval so the guest's virtual counter (and thus CLOCK_MONOTONIC) does
+/// not jump on resume — the KVM analogue of macOS HVF's CNTVOFF adjust. Must run
+/// while the vCPU is paused.
+pub fn adjust_virtual_timer_offset(vcpu: &VcpuFd, delta_ns: u64) -> Result<()> {
+    if delta_ns == 0 {
+        return Ok(());
+    }
+    // Host timer frequency (Hz). On bare metal it equals the guest's CNTFRQ_EL0.
+    let cntfrq: u64;
+    unsafe { asm!("mrs {}, cntfrq_el0", out(reg) cntfrq) };
+    let delta_ticks: u64 = ((delta_ns as u128) * (cntfrq as u128) / 1_000_000_000)
+        .try_into()
+        .unwrap_or(u64::MAX);
+    if delta_ticks == 0 {
+        return Ok(());
+    }
+    let mut data = [0u8; 8];
+    // Some KVM-arm64 kernels don't expose CNTVOFF_EL2 (an EL2 reg) via ONE_REG
+    // to an EL1 guest vCPU (ENOENT). Treat that as "freeze unsupported here" and
+    // skip gracefully — warm resume still works, the guest clock just advances
+    // by the pause. Proper fix: the KVM_ARM vCPU timer-offset attribute.
+    if vcpu.get_one_reg(CNTVOFF_EL2, &mut data).is_err() {
+        return Ok(());
+    }
+    let current = u64::from_le_bytes(data);
+    let new_offset = current.saturating_add(delta_ticks);
+    vcpu.set_one_reg(CNTVOFF_EL2, &new_offset.to_le_bytes())
+        .map_err(Error::SetCoreRegister)?;
+    Ok(())
+}
 
 /// Configure core registers for a given CPU.
 ///

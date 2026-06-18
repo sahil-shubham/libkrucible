@@ -1237,6 +1237,11 @@ impl Vcpu {
                 return Err(Error::VcpuKvmClockCtrl(std::io::Error::last_os_error()));
             }
         }
+        #[cfg(target_arch = "aarch64")]
+        {
+            arch::aarch64::regs::adjust_virtual_timer_offset(&self.fd, paused_ns)
+                .map_err(Error::REGSConfiguration)?;
+        }
         Ok(())
     }
 
@@ -1732,9 +1737,11 @@ impl Vcpu {
         match self.event_receiver.recv() {
             // Paused ---- Resume ----> Running
             Ok(VcpuEvent::Resume { paused_ns }) => {
+                // Non-fatal: a clock-adjust failure must not kill the VM — the
+                // guest just resumes without the freeze (clock advances by the
+                // pause), as it did before this path existed.
                 if let Err(e) = self.adjust_guest_clock_after_pause(paused_ns) {
-                    error!("failed to adjust guest clock after pause: {e}");
-                    return self.exit(FC_EXIT_CODE_GENERIC_ERROR);
+                    error!("adjust guest clock after pause (continuing unfrozen): {e}");
                 }
                 self.response_sender
                     .send(VcpuResponse::Resumed)
