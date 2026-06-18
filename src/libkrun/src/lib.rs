@@ -1867,7 +1867,7 @@ fn control_handle(mut stream: UnixStream, vmm: &Arc<Mutex<vmm::Vmm>>) {
 }
 
 /// Write a self-contained cold-to-disk snapshot bundle to `dir`. macOS/HVF only.
-#[cfg(any(all(target_os = "macos", target_arch = "aarch64"), all(target_os = "linux", target_arch = "x86_64")))]
+#[cfg(cold_tier)]
 fn handle_snapshot(vmm: &Arc<Mutex<vmm::Vmm>>, dir: &str) -> String {
     use std::io::Write as _;
     if dir.is_empty() {
@@ -1917,7 +1917,7 @@ fn handle_snapshot(vmm: &Arc<Mutex<vmm::Vmm>>, dir: &str) -> String {
     format!("OK snapshotted {dir} ({bytes} bytes, paused)\n")
 }
 
-#[cfg(not(any(all(target_os = "macos", target_arch = "aarch64"), all(target_os = "linux", target_arch = "x86_64"))))]
+#[cfg(not(cold_tier))]
 fn handle_snapshot(_vmm: &Arc<Mutex<vmm::Vmm>>, _dir: &str) -> String {
     "ERR snapshot not supported on this platform\n".to_string()
 }
@@ -3152,7 +3152,7 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
     // Cold restore: load the checkpoint (VM/vCPU/device state) from the bundle
     // before building so the vCPUs start paused; the guest RAM is streamed in
     // after build (restore_and_resume). macOS/HVF only.
-    #[cfg(any(all(target_os = "macos", target_arch = "aarch64"), all(target_os = "linux", target_arch = "x86_64")))]
+    #[cfg(cold_tier)]
     let restore = match ctx_cfg.snapshot_dir.take() {
         Some(dir) => {
             let cp_path = dir.join("checkpoint.bin");
@@ -3168,9 +3168,9 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
         }
         None => None,
     };
-    #[cfg(any(all(target_os = "macos", target_arch = "aarch64"), all(target_os = "linux", target_arch = "x86_64")))]
+    #[cfg(cold_tier)]
     let restoring = restore.is_some();
-    #[cfg(not(any(all(target_os = "macos", target_arch = "aarch64"), all(target_os = "linux", target_arch = "x86_64"))))]
+    #[cfg(not(cold_tier))]
     let restoring = false;
 
     let _vmm = match vmm::builder::build_microvm(
@@ -3209,7 +3209,7 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
 
     // Cold restore: stream guest RAM into the freshly-built (paused) VM, replay
     // VM/device/vCPU state, and resume from the snapshot point.
-    #[cfg(any(all(target_os = "macos", target_arch = "aarch64"), all(target_os = "linux", target_arch = "x86_64")))]
+    #[cfg(cold_tier)]
     if let Some((checkpoint, mem_path)) = restore {
         let mut mem_file = match std::fs::File::open(&mem_path) {
             Ok(f) => std::io::BufReader::new(f),
