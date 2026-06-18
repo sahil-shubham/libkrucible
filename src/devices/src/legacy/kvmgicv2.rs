@@ -143,4 +143,17 @@ impl GICDevice for KvmGicV2 {
     fn version(&self) -> u32 {
         kvm_bindings::kvm_device_type_KVM_DEV_TYPE_ARM_VGIC_V2
     }
+
+    fn save_state(&self) -> std::result::Result<Vec<u8>, String> {
+        // TODO(arm64-cold-tier): capture the GICv2 distributor (GICD_*) and
+        // per-vCPU CPU-interface (GICC_*) registers via
+        // KVM_DEV_ARM_VGIC_GRP_{DIST,CPU}_REGS on `self._device_fd`, honoring the
+        // per-vCPU banking of the first 32 IRQs (SGI/PPI). The device_fd is held
+        // for exactly this. See docs/PLAN-krucible-arm64-cold-tier.md §4.
+        Err("aarch64 GICv2 cold-tier save not yet implemented".to_string())
+    }
+
+    fn restore_state(&self, _blob: &[u8]) -> std::result::Result<(), String> {
+        Err("aarch64 GICv2 cold-tier restore not yet implemented".to_string())
+    }
 }

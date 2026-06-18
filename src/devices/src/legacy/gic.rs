@@ -13,4 +13,17 @@ pub trait GICDevice {
 
     /// Returns the GIC version of the device
     fn version(&self) -> u32;
+
+    /// Capture the interrupt-controller state for a cold snapshot as a
+    /// version-tagged, opaque blob. Default: unsupported — only the in-kernel
+    /// KVM GICs implement it; the macOS/HVF and userspace paths capture state
+    /// their own way or don't support the cold tier.
+    fn save_state(&self) -> std::result::Result<Vec<u8>, String> {
+        Err("interrupt controller does not support cold-tier save/restore".to_string())
+    }
+
+    /// Restore a blob produced by [`GICDevice::save_state`]. Default: unsupported.
+    fn restore_state(&self, _blob: &[u8]) -> std::result::Result<(), String> {
+        Err("interrupt controller does not support cold-tier save/restore".to_string())
+    }
 }

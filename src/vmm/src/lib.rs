@@ -329,6 +329,12 @@ pub struct Vmm {
     mmio_device_manager: MMIODeviceManager,
     #[cfg(target_arch = "x86_64")]
     pio_device_manager: PortIODeviceManager,
+    // Interrupt controller (vGIC). Held so the cold tier can checkpoint/restore
+    // its state — on aarch64 the GIC is a per-VM KVM device (its own DeviceFd),
+    // unlike x86 where the irqchip lives behind the VM fd. (x86 captures via
+    // Vm::save_state instead.)
+    #[cfg(all(cold_tier, target_os = "linux", target_arch = "aarch64"))]
+    intc: IrqChip,
 
     // Warm-tier state — driven by pause()/resume(), read by the control socket.
     run_state: VmmRunState,
@@ -660,7 +666,23 @@ impl Vmm {
         self.pause()?;
         self.quiesce_devices();
         let vcpu_states = self.save_vcpu_states()?;
+        // VM-level state. x86: PIT/clock/PIC/IOAPIC behind the VM fd. aarch64:
+        // the vGIC, a separate KVM device held in self.intc.
+        // macOS/aarch64 captures the GIC inside Vm::save_state (HVF); only
+        // linux/aarch64 reaches the vGIC through the separate KVM device (intc).
+        #[cfg(not(all(target_os = "linux", target_arch = "aarch64")))]
         let vm_state = self.vm.save_state().map_err(Error::Vm)?;
+        #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+        let vm_state = {
+            use devices::legacy::gic::GICDevice;
+            let gic = self
+                .intc
+                .lock()
+                .expect("poisoned intc lock")
+                .save_state()
+                .map_err(|e| Error::Snapshot(format!("gic save: {e}")))?;
+            vstate::VmState { gic }
+        };
         let devices = self.snapshot_devices();
         let mem_descs = snapshot::write_guest_memory(&self.guest_memory, mem_out)
             .map_err(|e| Error::Snapshot(format!("guest-memory dump: {e}")))?;
@@ -688,9 +710,19 @@ impl Vmm {
         let descs = snapshot::region_descs(&self.guest_memory);
         snapshot::read_guest_memory_into(&self.guest_memory, &descs, mem_in)
             .map_err(|e| Error::Snapshot(format!("guest-memory load: {e}")))?;
+        #[cfg(not(all(target_os = "linux", target_arch = "aarch64")))]
         self.vm
             .restore_state(&checkpoint.vm_state)
             .map_err(Error::Vm)?;
+        #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+        {
+            use devices::legacy::gic::GICDevice;
+            self.intc
+                .lock()
+                .expect("poisoned intc lock")
+                .restore_state(&checkpoint.vm_state.gic)
+                .map_err(|e| Error::Snapshot(format!("gic restore: {e}")))?;
+        }
         self.restore_activate_devices(&checkpoint.devices)?;
         self.restore_vcpu_states(checkpoint.vcpu_states)?;
         // Resume with paused_ns=0: the absolute CNTVOFF was already restored by

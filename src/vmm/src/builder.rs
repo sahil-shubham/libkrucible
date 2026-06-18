@@ -1003,6 +1003,8 @@ pub fn build_microvm(
         mmio_device_manager,
         #[cfg(target_arch = "x86_64")]
         pio_device_manager,
+        #[cfg(all(cold_tier, target_os = "linux", target_arch = "aarch64"))]
+        intc: intc.clone(),
         run_state: super::VmmRunState::Running,
         paused_at: None,
     };

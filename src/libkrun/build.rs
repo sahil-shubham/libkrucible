@@ -24,7 +24,7 @@ fn emit_cold_tier_cfg() {
     let arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
     let cold = matches!(
         (os.as_str(), arch.as_str()),
-        ("macos", "aarch64") | ("linux", "x86_64")
+        ("macos", "aarch64") | ("linux", "x86_64") | ("linux", "aarch64")
     );
     if cold {
         println!("cargo:rustc-cfg=cold_tier");

@@ -73,6 +73,14 @@ impl GICDevice for IrqChipDevice {
     fn version(&self) -> u32 {
         self.inner.version()
     }
+
+    fn save_state(&self) -> std::result::Result<Vec<u8>, String> {
+        self.inner.save_state()
+    }
+
+    fn restore_state(&self, blob: &[u8]) -> std::result::Result<(), String> {
+        self.inner.restore_state(blob)
+    }
 }
 
 #[cfg(target_arch = "riscv64")]

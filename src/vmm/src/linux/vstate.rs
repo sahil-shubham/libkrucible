@@ -120,6 +120,9 @@ pub enum Error {
     #[cfg(target_arch = "aarch64")]
     /// Error configuring the general purpose aarch64 registers.
     REGSConfiguration(arch::aarch64::regs::Error),
+    /// aarch64 cold-tier vCPU save/restore failure (reg-list / one-reg / mp-state).
+    #[cfg(all(cold_tier, target_arch = "aarch64"))]
+    VcpuAarch64State(String),
     #[cfg(target_arch = "riscv64")]
     /// Error configuring the general purpose riscv64 registers.
     REGSConfiguration(arch::riscv64::regs::Error),
@@ -343,6 +346,8 @@ impl Display for Error {
                 f,
                 "Error configuring the general purpose aarch64 registers: {e:?}"
             ),
+            #[cfg(all(cold_tier, target_arch = "aarch64"))]
+            VcpuAarch64State(e) => write!(f, "aarch64 vCPU save/restore: {e}"),
             #[cfg(target_arch = "riscv64")]
             REGSConfiguration(e) => write!(
                 f,
@@ -1217,7 +1222,7 @@ impl Vcpu {
     /// No-op on Linux: the vCPU thread always enters the Paused state first (see
     /// `run`), so cold restore starts paused for free. Kept for signature parity
     /// with the macOS Vcpu (the cold-tier `start_vcpus_paused` calls it).
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(cold_tier)]
     pub fn set_start_paused(&mut self, _paused: bool) {}
 
     /// Warm-tier clock continuity, per-vCPU half.
@@ -1523,6 +1528,56 @@ impl Vcpu {
         Ok(())
     }
 
+    /// Capture the full migratable aarch64 register set (core + system + fp +
+    /// timer regs, enumerated dynamically via KVM_GET_REG_LIST so it tracks the
+    /// kernel/feature-specific set) plus the MP/PSCI power state. The vCPU must
+    /// be paused and already KVM_ARM_VCPU_INIT'd. (Cold tier.)
+    #[cfg(all(cold_tier, target_arch = "aarch64"))]
+    fn save_state(&self) -> Result<VcpuState> {
+        use kvm_bindings::RegList;
+        // KVM_GET_REG_LIST writes the required count into the FAM `n` field when
+        // the buffer is too small (E2BIG). Probe with 0, then allocate exactly.
+        let mut probe = RegList::new(0)
+            .map_err(|e| Error::VcpuAarch64State(format!("alloc reg list: {e:?}")))?;
+        let _ = self.fd.get_reg_list(&mut probe);
+        let count = probe.as_fam_struct_ref().n as usize;
+        let mut reg_list = RegList::new(count)
+            .map_err(|e| Error::VcpuAarch64State(format!("alloc reg list ({count}): {e:?}")))?;
+        self.fd
+            .get_reg_list(&mut reg_list)
+            .map_err(|e| Error::VcpuAarch64State(format!("KVM_GET_REG_LIST: {e}")))?;
+
+        let ids = reg_list.as_slice().to_vec();
+        let mut regs = Vec::with_capacity(ids.len());
+        for id in ids {
+            let mut buf = vec![0u8; aarch64_reg_size(id)];
+            self.fd
+                .get_one_reg(id, &mut buf)
+                .map_err(|e| Error::VcpuAarch64State(format!("GET_ONE_REG {id:#x}: {e}")))?;
+            regs.push((id, buf));
+        }
+        let mp_state = self
+            .fd
+            .get_mp_state()
+            .map_err(|e| Error::VcpuAarch64State(format!("GET_MP_STATE: {e}")))?;
+        Ok(VcpuState { regs, mp_state })
+    }
+
+    /// Restore a captured aarch64 register set + MP state onto the (paused,
+    /// freshly INIT'd) vCPU. (Cold tier.)
+    #[cfg(all(cold_tier, target_arch = "aarch64"))]
+    fn restore_state(&self, state: VcpuState) -> Result<()> {
+        for (id, bytes) in &state.regs {
+            self.fd
+                .set_one_reg(*id, bytes)
+                .map_err(|e| Error::VcpuAarch64State(format!("SET_ONE_REG {id:#x}: {e}")))?;
+        }
+        self.fd
+            .set_mp_state(state.mp_state)
+            .map_err(|e| Error::VcpuAarch64State(format!("SET_MP_STATE: {e}")))?;
+        Ok(())
+    }
+
     /// Runs the vCPU in KVM context and handles the kvm exit reason.
     ///
     /// Returns error or enum specifying whether emulation was handled or interrupted.
@@ -1726,7 +1781,7 @@ impl Vcpu {
             }
             // Save/restore are only valid while paused; the orchestrator always
             // pauses first, so receiving one while running is a protocol error.
-            #[cfg(target_arch = "x86_64")]
+            #[cfg(cold_tier)]
             Ok(VcpuEvent::SaveState | VcpuEvent::RestoreState(_)) => {
                 error!("ignoring vcpu SaveState/RestoreState received while running");
             }
@@ -1761,7 +1816,7 @@ impl Vcpu {
             }
             // Checkpoint: capture full vCPU register state while paused (the only
             // safe point — KVM_GET_VCPU_EVENTS is unsafe while other vCPUs run).
-            #[cfg(target_arch = "x86_64")]
+            #[cfg(cold_tier)]
             Ok(VcpuEvent::SaveState) => match self.save_state() {
                 Ok(vcpu_state) => {
                     self.response_sender
@@ -1775,7 +1830,7 @@ impl Vcpu {
                 }
             },
             // Restore: load captured register state onto the paused vCPU.
-            #[cfg(target_arch = "x86_64")]
+            #[cfg(cold_tier)]
             Ok(VcpuEvent::RestoreState(vcpu_state)) => {
                 if let Err(e) = self.restore_state(*vcpu_state) {
                     error!("failed to restore vcpu state: {e:?}");
@@ -1867,7 +1922,7 @@ pub struct VcpuState {
 // the entries. This is the checkpoint.bin format for the linux/x86 cold tier;
 // no cross-version compatibility (the manifest carries a version).
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(cold_tier)]
 fn ser_pod<T>(out: &mut Vec<u8>, v: &T) {
     // Safety: `T` is a #[repr(C)] POD KVM struct; reading its bytes is sound.
     let bytes =
@@ -1875,7 +1930,7 @@ fn ser_pod<T>(out: &mut Vec<u8>, v: &T) {
     out.extend_from_slice(bytes);
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(cold_tier)]
 fn de_pod<T>(inp: &[u8], pos: &mut usize) -> std::result::Result<T, String> {
     let sz = std::mem::size_of::<T>();
     if *pos + sz > inp.len() {
@@ -1958,6 +2013,108 @@ impl std::fmt::Debug for VcpuState {
     }
 }
 
+// --- aarch64 cold-tier vCPU + VM state -----------------------------------------
+
+/// Captured aarch64 vCPU state: the migratable register set as raw
+/// (KVM reg id -> value bytes) pairs (the width is encoded in the id, so fp/SIMD
+/// 128-bit regs round-trip too), plus the MP/PSCI power state.
+#[cfg(all(cold_tier, target_arch = "aarch64"))]
+pub struct VcpuState {
+    regs: Vec<(u64, Vec<u8>)>,
+    mp_state: kvm_bindings::kvm_mp_state,
+}
+
+/// Width in bytes of an aarch64 KVM register, decoded from bits [52:55] of the
+/// reg id: `1 << ((id & KVM_REG_SIZE_MASK) >> 52)`.
+#[cfg(all(cold_tier, target_arch = "aarch64"))]
+fn aarch64_reg_size(reg_id: u64) -> usize {
+    let shift = kvm_bindings::KVM_REG_SIZE_MASK.trailing_zeros();
+    1usize << ((reg_id & kvm_bindings::KVM_REG_SIZE_MASK) >> shift)
+}
+
+#[cfg(all(cold_tier, target_arch = "aarch64"))]
+impl VcpuState {
+    /// Serialize to a self-describing blob: reg count, then (id:u64, len:u32,
+    /// bytes) per reg, then the POD mp_state.
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&(self.regs.len() as u32).to_le_bytes());
+        for (id, bytes) in &self.regs {
+            out.extend_from_slice(&id.to_le_bytes());
+            out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+            out.extend_from_slice(bytes);
+        }
+        ser_pod(&mut out, &self.mp_state);
+        out
+    }
+
+    pub fn deserialize(bytes: &[u8]) -> std::result::Result<VcpuState, String> {
+        let mut pos = 0usize;
+        let rd_u32 = |p: &mut usize| -> std::result::Result<u32, String> {
+            if *p + 4 > bytes.len() {
+                return Err("vcpu state truncated (u32)".to_string());
+            }
+            let v = u32::from_le_bytes(bytes[*p..*p + 4].try_into().unwrap());
+            *p += 4;
+            Ok(v)
+        };
+        let n = rd_u32(&mut pos)? as usize;
+        let mut regs = Vec::with_capacity(n);
+        for _ in 0..n {
+            if pos + 8 > bytes.len() {
+                return Err("vcpu state truncated (reg id)".to_string());
+            }
+            let id = u64::from_le_bytes(bytes[pos..pos + 8].try_into().unwrap());
+            pos += 8;
+            let len = rd_u32(&mut pos)? as usize;
+            if pos + len > bytes.len() {
+                return Err("vcpu state truncated (reg bytes)".to_string());
+            }
+            regs.push((id, bytes[pos..pos + len].to_vec()));
+            pos += len;
+        }
+        let mp_state: kvm_bindings::kvm_mp_state = de_pod(bytes, &mut pos)?;
+        Ok(VcpuState { regs, mp_state })
+    }
+}
+
+#[cfg(all(cold_tier, target_arch = "aarch64"))]
+impl std::fmt::Debug for VcpuState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "VcpuState {{ {} regs }}", self.regs.len())
+    }
+}
+
+/// aarch64 cold-tier VM-level state: the interrupt-controller (vGIC) blob,
+/// version-tagged and opaque to this layer (the GICDevice impl owns the format).
+#[cfg(all(cold_tier, target_arch = "aarch64"))]
+pub struct VmState {
+    pub gic: Vec<u8>,
+}
+
+#[cfg(all(cold_tier, target_arch = "aarch64"))]
+impl VmState {
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(4 + self.gic.len());
+        out.extend_from_slice(&(self.gic.len() as u32).to_le_bytes());
+        out.extend_from_slice(&self.gic);
+        out
+    }
+
+    pub fn deserialize(bytes: &[u8]) -> std::result::Result<VmState, String> {
+        if bytes.len() < 4 {
+            return Err("vm state truncated".to_string());
+        }
+        let n = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
+        if 4 + n > bytes.len() {
+            return Err("vm state truncated (gic)".to_string());
+        }
+        Ok(VmState {
+            gic: bytes[4..4 + n].to_vec(),
+        })
+    }
+}
+
 #[cfg(target_arch = "x86_64")]
 impl VmState {
     /// Serialize the VM-level KVM state (PIT, clock, PIC/IOAPIC) to a byte blob.
@@ -2002,11 +2159,11 @@ pub enum VcpuEvent {
     Resume { paused_ns: u64 },
     /// Capture the full vCPU register state into a [`VcpuState`] (vCPU must be
     /// paused). The vCPU replies with [`VcpuResponse::SavedState`].
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(cold_tier)]
     SaveState,
     /// Restore a previously-captured [`VcpuState`] onto the (paused) vCPU. The
     /// vCPU replies with [`VcpuResponse::RestoredState`].
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(cold_tier)]
     RestoreState(Box<VcpuState>),
 }
 
@@ -2021,10 +2178,10 @@ pub enum VcpuResponse {
     /// Vcpu is stopped.
     Exited(u8),
     /// Captured vCPU register state, in reply to [`VcpuEvent::SaveState`].
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(cold_tier)]
     SavedState(Box<VcpuState>),
     /// Acknowledges a [`VcpuEvent::RestoreState`].
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(cold_tier)]
     RestoredState,
 }
 

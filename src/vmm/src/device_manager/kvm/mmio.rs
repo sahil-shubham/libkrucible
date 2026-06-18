@@ -90,8 +90,8 @@ pub struct MMIODeviceManager {
     last_irq: u32,
     id_to_dev_info: HashMap<(DeviceType, String), MMIODeviceInfo>,
     // Registered virtio transports, kept for the cold-tier device persist
-    // (snapshot/restore). x86 only — the cold tier targets linux/x86.
-    #[cfg(target_arch = "x86_64")]
+    // (snapshot/restore). Present on every cold-tier target.
+    #[cfg(cold_tier)]
     mmio_transports: Vec<Arc<Mutex<devices::virtio::MmioTransport>>>,
 }
 
@@ -107,7 +107,7 @@ impl MMIODeviceManager {
             last_irq: irq_interval.1,
             bus: devices::Bus::new(),
             id_to_dev_info: HashMap::new(),
-            #[cfg(target_arch = "x86_64")]
+            #[cfg(cold_tier)]
             mmio_transports: Vec::new(),
         }
     }
@@ -156,7 +156,7 @@ impl MMIODeviceManager {
         mmio_device.set_irq_line(self.irq);
 
         let transport = Arc::new(Mutex::new(mmio_device));
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(cold_tier)]
         self.mmio_transports.push(transport.clone());
         self.bus
             .insert(transport, self.mmio_base, MMIO_LEN)
@@ -178,7 +178,7 @@ impl MMIODeviceManager {
 
     /// Capture the runtime state of every snapshot-supporting virtio device for
     /// a VM checkpoint. Pause vCPUs + quiesce_devices first. (Cold tier.)
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(cold_tier)]
     pub fn snapshot_devices(&self) -> devices::virtio::persist::VmDevicesState {
         let mut snapshots = Vec::new();
         for t in &self.mmio_transports {
@@ -191,7 +191,7 @@ impl MMIODeviceManager {
     }
 
     /// Quiesce every virtio device (drain+reclaim its worker) before snapshot.
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(cold_tier)]
     pub fn quiesce_devices(&self) {
         for t in &self.mmio_transports {
             t.lock()
@@ -202,7 +202,7 @@ impl MMIODeviceManager {
     }
 
     /// Re-arm every device quiesced by [`Self::quiesce_devices`].
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(cold_tier)]
     pub fn rearm_devices(&self) {
         for t in &self.mmio_transports {
             t.lock()
@@ -216,7 +216,7 @@ impl MMIODeviceManager {
     /// restore): match each saved snapshot to a not-yet-consumed transport of
     /// the same device type, restore device state, re-activate from the saved
     /// queue state + features (bypassing the guest handshake).
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(cold_tier)]
     pub fn restore_activate_devices(
         &self,
         state: &devices::virtio::persist::VmDevicesState,
