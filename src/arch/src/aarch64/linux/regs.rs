@@ -101,14 +101,25 @@ macro_rules! arm64_sys_reg {
 // https://elixir.bootlin.com/linux/v4.20.17/source/arch/arm64/include/asm/sysreg.h#L135
 arm64_sys_reg!(MPIDR_EL1, 3, 0, 0, 0, 5);
 
-// CNTVOFF_EL2: virtual-timer counter offset (op0=3, op1=4, CRn=14, CRm=0, op2=3).
-// KVM implements the guest virtual counter as CNTVCT_EL0 = CNTPCT_EL0 - CNTVOFF_EL2.
-arm64_sys_reg!(CNTVOFF_EL2, 3, 4, 14, 0, 3);
+// KVM_REG_ARM_TIMER_CNT: the guest's virtual counter (CNTVCT), exposed to the
+// EL1 guest vCPU — unlike CNTVOFF_EL2, an EL2 register KVM will not surface via
+// ONE_REG to an EL1 guest (it returns ENOENT). Writing this register adjusts the
+// VM-wide virtual-counter offset, which is exactly the freeze lever.
+//
+// WARNING (from the kernel uapi, arch/arm64/include/uapi/asm/kvm.h): the ABI
+// encodings for KVM_REG_ARM_TIMER_CVAL and KVM_REG_ARM_TIMER_CNT were
+// accidentally swapped and are now set in stone, so the counter is the
+// ARM64_SYS_REG(3,3,14,3,2) slot — we use the fixed ABI value, NOT the value
+// derived from the architectural CNTVCT_EL0 encoding.
+arm64_sys_reg!(KVM_REG_ARM_TIMER_CNT, 3, 3, 14, 3, 2);
 
-/// Warm-tier clock freeze (arm64): nudge the virtual-timer offset forward by the
-/// paused interval so the guest's virtual counter (and thus CLOCK_MONOTONIC) does
-/// not jump on resume — the KVM analogue of macOS HVF's CNTVOFF adjust. Must run
-/// while the vCPU is paused.
+/// Warm-tier clock freeze (arm64): rewind the guest's virtual counter by the
+/// paused interval so its virtual counter (and thus CLOCK_MONOTONIC) does not
+/// jump on resume — the KVM analogue of macOS HVF's CNTVOFF adjust.
+///
+/// The virtual-counter offset is VM-wide on modern KVM (a single offset shared
+/// by all vCPUs), so the caller MUST apply this exactly once — on vCPU 0 — not
+/// per-vCPU, or the rewind compounds N times. Must run while the vCPU is paused.
 pub fn adjust_virtual_timer_offset(vcpu: &VcpuFd, delta_ns: u64) -> Result<()> {
     if delta_ns == 0 {
         return Ok(());
@@ -123,16 +134,13 @@ pub fn adjust_virtual_timer_offset(vcpu: &VcpuFd, delta_ns: u64) -> Result<()> {
         return Ok(());
     }
     let mut data = [0u8; 8];
-    // Some KVM-arm64 kernels don't expose CNTVOFF_EL2 (an EL2 reg) via ONE_REG
-    // to an EL1 guest vCPU (ENOENT). Treat that as "freeze unsupported here" and
-    // skip gracefully — warm resume still works, the guest clock just advances
-    // by the pause. Proper fix: the KVM_ARM vCPU timer-offset attribute.
-    if vcpu.get_one_reg(CNTVOFF_EL2, &mut data).is_err() {
-        return Ok(());
-    }
+    vcpu.get_one_reg(KVM_REG_ARM_TIMER_CNT, &mut data)
+        .map_err(Error::GetSysRegister)?;
     let current = u64::from_le_bytes(data);
-    let new_offset = current.saturating_add(delta_ticks);
-    vcpu.set_one_reg(CNTVOFF_EL2, &new_offset.to_le_bytes())
+    // Rewind by the pause so the guest counter resumes where it left off rather
+    // than jumping forward by the wall-clock pause duration.
+    let frozen = current.saturating_sub(delta_ticks);
+    vcpu.set_one_reg(KVM_REG_ARM_TIMER_CNT, &frozen.to_le_bytes())
         .map_err(Error::SetCoreRegister)?;
     Ok(())
 }

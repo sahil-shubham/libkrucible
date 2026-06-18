@@ -1220,11 +1220,17 @@ impl Vcpu {
     #[cfg(target_arch = "x86_64")]
     pub fn set_start_paused(&mut self, _paused: bool) {}
 
-    /// Warm-tier clock continuity, per-vCPU half: tell the guest its clock was
-    /// stopped (PVCLOCK_GUEST_STOPPED) so it absorbs the VM-level kvmclock rewind
-    /// (Vm::adjust_clock_after_pause) without firing soft-lockup/RCU-stall
-    /// watchdogs. Must run while the vCPU is paused. x86 only; arm64 (CNTVOFF)
-    /// lands with Tier-3.
+    /// Warm-tier clock continuity, per-vCPU half.
+    ///
+    /// x86: tell the guest its clock was stopped (PVCLOCK_GUEST_STOPPED) so it
+    /// absorbs the VM-level kvmclock rewind (Vm::adjust_clock_after_pause)
+    /// without firing soft-lockup/RCU-stall watchdogs.
+    ///
+    /// arm64: rewind the guest virtual counter by the pause (the offset is
+    /// VM-wide on KVM, so this is applied once, on vCPU 0). There is no VM-level
+    /// half on arm64 — Vm::adjust_clock_after_pause is an x86-only no-op there.
+    ///
+    /// Must run while the vCPU is paused.
     fn adjust_guest_clock_after_pause(&self, paused_ns: u64) -> Result<()> {
         if paused_ns == 0 {
             return Ok(());
@@ -1239,8 +1245,12 @@ impl Vcpu {
         }
         #[cfg(target_arch = "aarch64")]
         {
-            arch::aarch64::regs::adjust_virtual_timer_offset(&self.fd, paused_ns)
-                .map_err(Error::REGSConfiguration)?;
+            // The virtual-counter offset is VM-wide on modern KVM, so apply the
+            // rewind exactly once — doing it per-vCPU compounds the freeze N times.
+            if self.id == 0 {
+                arch::aarch64::regs::adjust_virtual_timer_offset(&self.fd, paused_ns)
+                    .map_err(Error::REGSConfiguration)?;
+            }
         }
         Ok(())
     }
