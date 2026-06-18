@@ -253,6 +253,9 @@ pub enum Error {
     /// Failed to set KVM vm clock.
     VmSetClock(kvm_ioctls::Error),
     #[cfg(target_arch = "x86_64")]
+    /// Failed the per-vCPU KVM_KVMCLOCK_CTRL on resume.
+    VcpuKvmClockCtrl(std::io::Error),
+    #[cfg(target_arch = "x86_64")]
     /// Failed to set KVM vm irqchip.
     VmSetIrqChip(kvm_ioctls::Error),
     /// Cannot configure the microvm.
@@ -411,6 +414,8 @@ impl Display for Error {
             VmSetPit2(e) => write!(f, "Failed to set KVM vm pit state: {e}"),
             #[cfg(target_arch = "x86_64")]
             VmSetClock(e) => write!(f, "Failed to set KVM vm clock: {e}"),
+            #[cfg(target_arch = "x86_64")]
+            VcpuKvmClockCtrl(e) => write!(f, "Failed KVM_KVMCLOCK_CTRL on resume: {e}"),
             #[cfg(target_arch = "x86_64")]
             VmSetIrqChip(e) => write!(f, "Failed to set KVM vm irqchip: {e}"),
             #[cfg(target_arch = "aarch64")]
@@ -861,6 +866,25 @@ impl Vm {
         &self.fd
     }
 
+    /// Warm-tier clock continuity: rewind the kvmclock by the paused interval so
+    /// the guest's monotonic clock does not jump forward by the pause duration
+    /// on resume — the KVM analogue of the macOS CNTVOFF vtimer freeze. x86 only
+    /// (kvmclock is VM-level); arm64 continuity needs the per-vCPU CNTVOFF and
+    /// lands with the Tier-3 arm64 cold work.
+    pub fn adjust_clock_after_pause(&self, paused_ns: u64) -> Result<()> {
+        if paused_ns == 0 {
+            return Ok(());
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            let mut clock = self.fd.get_clock().map_err(Error::VmGetClock)?;
+            clock.clock = clock.clock.saturating_sub(paused_ns);
+            clock.flags &= !KVM_CLOCK_TSC_STABLE;
+            self.fd.set_clock(&clock).map_err(Error::VmSetClock)?;
+        }
+        Ok(())
+    }
+
     #[allow(unused)]
     #[cfg(target_arch = "x86_64")]
     /// Saves and returns the Kvm Vm state.
@@ -1195,6 +1219,26 @@ impl Vcpu {
     /// with the macOS Vcpu (the cold-tier `start_vcpus_paused` calls it).
     #[cfg(target_arch = "x86_64")]
     pub fn set_start_paused(&mut self, _paused: bool) {}
+
+    /// Warm-tier clock continuity, per-vCPU half: tell the guest its clock was
+    /// stopped (PVCLOCK_GUEST_STOPPED) so it absorbs the VM-level kvmclock rewind
+    /// (Vm::adjust_clock_after_pause) without firing soft-lockup/RCU-stall
+    /// watchdogs. Must run while the vCPU is paused. x86 only; arm64 (CNTVOFF)
+    /// lands with Tier-3.
+    fn adjust_guest_clock_after_pause(&self, paused_ns: u64) -> Result<()> {
+        if paused_ns == 0 {
+            return Ok(());
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            use std::os::fd::AsRawFd;
+            let ret = unsafe { libc::ioctl(self.fd.as_raw_fd(), KVM_KVMCLOCK_CTRL) };
+            if ret < 0 {
+                return Err(Error::VcpuKvmClockCtrl(std::io::Error::last_os_error()));
+            }
+        }
+        Ok(())
+    }
 
     #[cfg(target_arch = "x86_64")]
     #[allow(unused_variables)]
@@ -1660,7 +1704,7 @@ impl Vcpu {
                 // Move to 'paused' state.
                 state = StateMachine::next(Self::paused);
             }
-            Ok(VcpuEvent::Resume) => {
+            Ok(VcpuEvent::Resume { .. }) => {
                 self.response_sender
                     .send(VcpuResponse::Resumed)
                     .expect("failed to send resume status");
@@ -1687,8 +1731,11 @@ impl Vcpu {
     fn paused(&mut self) -> StateMachine<Self> {
         match self.event_receiver.recv() {
             // Paused ---- Resume ----> Running
-            Ok(VcpuEvent::Resume) => {
-                // Nothing special to do.
+            Ok(VcpuEvent::Resume { paused_ns }) => {
+                if let Err(e) = self.adjust_guest_clock_after_pause(paused_ns) {
+                    error!("failed to adjust guest clock after pause: {e}");
+                    return self.exit(FC_EXIT_CODE_GENERIC_ERROR);
+                }
                 self.response_sender
                     .send(VcpuResponse::Resumed)
                     .expect("failed to send resume status");
@@ -1920,6 +1967,11 @@ impl VmState {
     }
 }
 
+/// KVM_KVMCLOCK_CTRL ioctl number (no arg): marks the guest's pvclock as
+/// GUEST_STOPPED so it absorbs a clock discontinuity on resume.
+#[cfg(target_arch = "x86_64")]
+const KVM_KVMCLOCK_CTRL: libc::c_ulong = 0xAEAD;
+
 // Allow currently unused Pause and Exit events. These will be used by the vmm later on.
 #[allow(unused)]
 #[derive(Debug)]
@@ -1927,8 +1979,10 @@ impl VmState {
 pub enum VcpuEvent {
     /// Pause the Vcpu.
     Pause,
-    /// Event that should resume the Vcpu.
-    Resume,
+    /// Resume the Vcpu, carrying how long it was paused so it can keep the guest
+    /// clock continuous (x86: KVM_KVMCLOCK_CTRL sets PVCLOCK_GUEST_STOPPED so the
+    /// guest absorbs the kvmclock rewind without a soft-lockup/RCU stall).
+    Resume { paused_ns: u64 },
     /// Capture the full vCPU register state into a [`VcpuState`] (vCPU must be
     /// paused). The vCPU replies with [`VcpuResponse::SavedState`].
     #[cfg(target_arch = "x86_64")]

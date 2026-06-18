@@ -393,10 +393,17 @@ impl Vmm {
     /// Linux today (KVM guest-clock continuity on warm resume is a separate
     /// follow-up); the parameter keeps the cross-platform signature uniform.
     #[cfg(target_os = "linux")]
-    pub fn resume_vcpus(&mut self, _paused_duration: Duration) -> Result<()> {
+    pub fn resume_vcpus(&mut self, paused_duration: Duration) -> Result<()> {
+        // Warm-tier clock continuity: rewind the kvmclock by the paused interval
+        // (VM-level, once) before resuming, so the guest's monotonic clock does
+        // not jump on resume — the KVM analogue of the macOS CNTVOFF freeze.
+        let paused_ns = u64::try_from(paused_duration.as_nanos()).unwrap_or(u64::MAX);
+        self.vm
+            .adjust_clock_after_pause(paused_ns)
+            .map_err(Error::Vm)?;
         for handle in self.vcpus_handles.iter() {
             handle
-                .send_event(VcpuEvent::Resume)
+                .send_event(VcpuEvent::Resume { paused_ns })
                 .map_err(Error::VcpuEvent)?;
         }
         for handle in self.vcpus_handles.iter() {

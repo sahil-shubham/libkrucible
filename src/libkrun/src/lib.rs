@@ -3082,13 +3082,18 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
     let is_block_root = ctx_cfg.root_block_cfg.is_some();
     #[cfg(not(feature = "blk"))]
     let is_block_root = false;
+    // clocksource=kvm-clock: on x86, make CLOCK_MONOTONIC use the paravirtual
+    // kvmclock (not the TSC) so the warm-tier KVM_SET_CLOCK rewind on resume
+    // actually freezes the guest's monotonic clock across a pause. Ignored on
+    // aarch64 (which uses the arch timer + CNTVOFF freeze).
     let prolog = if is_block_root {
         format!(
             "reboot=k panic=-1 panic_print=0 nomodule console=hvc0 \
-             root=/dev/vda rootfstype=ext4 rw quiet no-kvmapf init={INIT_PATH}"
+             root=/dev/vda rootfstype=ext4 rw quiet no-kvmapf \
+             clocksource=kvm-clock init={INIT_PATH}"
         )
     } else {
-        format!("{DEFAULT_KERNEL_CMDLINE} init={INIT_PATH}")
+        format!("{DEFAULT_KERNEL_CMDLINE} clocksource=kvm-clock init={INIT_PATH}")
     };
     let kernel_cmdline = KernelCmdlineConfig {
         prolog: Some(prolog),
