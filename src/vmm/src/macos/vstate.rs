@@ -502,10 +502,17 @@ impl Vcpu {
             .send(hvf_vcpuid)
             .expect("Cannot notify vcpu TLS initialization.");
 
-        let entry_addr = if let Some(boot_receiver) = &self.boot_receiver {
-            boot_receiver.recv().unwrap()
-        } else {
-            self.boot_entry_addr
+        // Secondary vCPUs (cpu_index != 0) normally block here until vCPU 0
+        // PSCI-CPU_ONs them with their entry address. On a cold restore there is
+        // no PSCI bring-up — the vCPU was already online in the snapshot, and
+        // RestoreState sets its real PC/PSTATE/regs below — and vCPU 0 is itself
+        // parked in run_paused_loop (start_paused) and would never signal. So
+        // blocking on boot_receiver here would deadlock a multi-vCPU restore
+        // (the vCPU never reaches run_paused_loop to ack RestoreState). When
+        // start_paused, skip the wait and use a placeholder entry (overwritten).
+        let entry_addr = match &self.boot_receiver {
+            Some(boot_receiver) if !self.start_paused => boot_receiver.recv().unwrap(),
+            _ => self.boot_entry_addr,
         };
 
         hvf_vcpu
