@@ -82,3 +82,41 @@ impl TryFrom<u32> for SyncMode {
         }
     }
 }
+
+/// Create a qcow2 copy-on-write overlay at `overlay_path` backed by the raw
+/// image at `backing_path` (of `virtual_size` bytes). The overlay starts empty
+/// — reads fall through to the backing, writes land in the overlay — so creating
+/// one is instant and **host-filesystem-independent** (no reflink / no btrfs).
+///
+/// Reuses `imago`, the same library that *opens* these images at boot, so the
+/// result is correct-by-construction (one qcow2 implementation, not two).
+pub fn create_qcow2_overlay(
+    overlay_path: &str,
+    backing_path: &str,
+    virtual_size: u64,
+) -> std::io::Result<()> {
+    use std::sync::Arc;
+
+    use imago::{
+        DynStorage, FormatAccess, FormatCreateBuilder, Storage, StorageOpenOptions,
+        file::File as ImagoFile, qcow2::Qcow2,
+    };
+
+    // Truncate-create the destination so imago can open it for writing.
+    std::fs::File::create(overlay_path)?;
+    let dest = ImagoFile::open_sync(StorageOpenOptions::new().write(true).filename(overlay_path))?;
+
+    let builder =
+        Qcow2::<Box<dyn DynStorage>, Arc<FormatAccess<Box<dyn DynStorage>>>>::create_builder(
+            Box::new(dest),
+        )
+        .backing(backing_path.to_string(), "raw".to_string())
+        .size(virtual_size);
+
+    // imago's create() is async and has no sync wrapper, so drive it on a
+    // current-thread tokio runtime (the same kind imago's sync wrappers use).
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .map_err(|e| std::io::Error::other(format!("tokio runtime: {e}")))?;
+    runtime.block_on(builder.create())
+}

@@ -160,6 +160,25 @@ int32_t krun_add_disk2(uint32_t ctx_id,
                        uint32_t disk_format,
                        bool read_only);
 
+/**
+ * Like krun_add_disk, but designates the ROOT block device (block_id "root", so
+ * it enumerates first as /dev/vda and the kernel cmdline roots on it) and accepts
+ * a non-Raw image format (KRUN_DISK_FORMAT_{RAW,QCOW2}). bhatti's single root-disk
+ * entry point; call it before any krun_add_disk so root stays /dev/vda.
+ *
+ * Returns zero on success or a negative error number on failure.
+ */
+int32_t krun_set_root_disk2(uint32_t ctx_id, const char *disk_path, uint32_t disk_format);
+
+/**
+ * Create a qcow2 copy-on-write overlay at "overlay_path" backed by the raw image
+ * at "backing_path" (of "backing_size" bytes). Instant + host-filesystem-
+ * independent (no reflink/btrfs, no qemu-img); reuses imago.
+ *
+ * Returns zero on success or a negative error number on failure.
+ */
+int32_t krun_create_disk_overlay(const char *overlay_path, const char *backing_path, uint64_t backing_size);
+
 
 /* Supported sync modes */
 

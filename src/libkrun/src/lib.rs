@@ -755,6 +755,83 @@ pub unsafe extern "C" fn krun_add_disk2(
     }
 }
 
+/// Like `krun_add_disk`, but designates the ROOT block device: tagged block_id
+/// "root" so it enumerates first (as /dev/vda) and the kernel cmdline roots on
+/// it, and it accepts a non-Raw image format (e.g. a qcow2 CoW overlay; Raw is
+/// also valid). bhatti's single root-disk entry point — call it before any
+/// krun_add_disk so root stays /dev/vda.
+#[allow(clippy::missing_safety_doc)]
+#[unsafe(no_mangle)]
+#[cfg(feature = "blk")]
+pub unsafe extern "C" fn krun_set_root_disk2(
+    ctx_id: u32,
+    c_disk_path: *const c_char,
+    disk_format: u32,
+) -> i32 {
+    unsafe {
+        let disk_path = match CStr::from_ptr(c_disk_path).to_str() {
+            Ok(disk) => disk,
+            Err(_) => return -libc::EINVAL,
+        };
+        let format = match ImageType::try_from(disk_format) {
+            Ok(format) => format,
+            Err(_) => return -libc::EINVAL,
+        };
+        match CTX_MAP.lock().unwrap().entry(ctx_id) {
+            Entry::Occupied(mut ctx_cfg) => {
+                let cfg = ctx_cfg.get_mut();
+                let block_device_config = BlockDeviceConfig {
+                    block_id: "root".to_string(),
+                    cache_type: CacheType::auto(disk_path),
+                    disk_image_path: disk_path.to_string(),
+                    disk_image_format: format,
+                    is_disk_read_only: false,
+                    direct_io: false,
+                    #[cfg(not(target_os = "macos"))]
+                    sync_mode: SyncMode::Full,
+                    #[cfg(target_os = "macos")]
+                    sync_mode: SyncMode::Relaxed,
+                };
+                cfg.add_block_cfg(block_device_config);
+            }
+            Entry::Vacant(_) => return -libc::ENOENT,
+        }
+        KRUN_SUCCESS
+    }
+}
+
+/// Create a qcow2 copy-on-write overlay at `overlay_path` backed by the raw
+/// image at `backing_path` (whose virtual size is `backing_size` bytes). Instant
+/// + host-filesystem-independent (no reflink/btrfs, no qemu-img); reuses imago.
+/// Returns zero on success or a negative error number on failure.
+#[allow(clippy::missing_safety_doc)]
+#[unsafe(no_mangle)]
+#[cfg(feature = "blk")]
+pub unsafe extern "C" fn krun_create_disk_overlay(
+    c_overlay_path: *const c_char,
+    c_backing_path: *const c_char,
+    backing_size: u64,
+) -> i32 {
+    unsafe {
+        let overlay_path = match CStr::from_ptr(c_overlay_path).to_str() {
+            Ok(s) => s,
+            Err(_) => return -libc::EINVAL,
+        };
+        let backing_path = match CStr::from_ptr(c_backing_path).to_str() {
+            Ok(s) => s,
+            Err(_) => return -libc::EINVAL,
+        };
+        match devices::virtio::block::create_qcow2_overlay(overlay_path, backing_path, backing_size)
+        {
+            Ok(()) => KRUN_SUCCESS,
+            Err(e) => {
+                error!("krun_create_disk_overlay failed: {e}");
+                -libc::EIO
+            }
+        }
+    }
+}
+
 #[allow(clippy::missing_safety_doc)]
 #[unsafe(no_mangle)]
 #[cfg(feature = "blk")]
@@ -3078,8 +3155,10 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
     // mount the block root itself. Swap the virtiofs root for an ext4 block root
     // in the cmdline (lohar then runs from /dev/vda). Requires virtio-blk + ext4
     // built in to the bundled kernel (nomodule). See PLAN-krucible-cold-tier.md.
+    // 2.0 flattened root/data into a single block_cfgs list; the root device is
+    // the one we tagged block_id "root" (see krun_set_root_disk2).
     #[cfg(feature = "blk")]
-    let is_block_root = ctx_cfg.root_block_cfg.is_some();
+    let is_block_root = ctx_cfg.block_cfgs.iter().any(|b| b.block_id == "root");
     #[cfg(not(feature = "blk"))]
     let is_block_root = false;
     // clocksource=kvm-clock: on x86, make CLOCK_MONOTONIC use the paravirtual
