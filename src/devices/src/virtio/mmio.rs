@@ -78,6 +78,7 @@ pub struct MmioTransport {
     queue_config: Vec<QueueConfig>,
     shm_region_select: u32,
     interrupt: InterruptTransport,
+    restored_interrupt_status: u32,
 }
 
 struct InterruptTransportInner {
@@ -138,6 +139,17 @@ impl InterruptTransport {
             .set_irq(self.0.irq_line, Some(&self.0.event))?;
         Ok(())
     }
+    /// Re-raise even an already pending bit: vCPU state restore may discard its IRQ.
+    fn replay(&self, status: u32) -> Result<(), crate::Error> {
+        let pending = self.status().fetch_or(status as usize, Ordering::SeqCst) | status as usize;
+        if pending != 0 {
+            self.intc()
+                .lock()
+                .unwrap()
+                .set_irq(self.0.irq_line, Some(&self.0.event))?;
+        }
+        Ok(())
+    }
 
     pub fn try_signal_used_queue(&self) -> Result<(), crate::Error> {
         debug!(target: &self.0.log_target, "interrupt: signal_used_queue");
@@ -193,6 +205,7 @@ impl MmioTransport {
             queue_evts,
             queue_config,
             shm_region_select: 0,
+            restored_interrupt_status: 0,
         })
     }
 
@@ -221,6 +234,22 @@ impl MmioTransport {
 
     pub fn interrupt_evt(&self) -> &EventFd {
         self.interrupt.event()
+    }
+    /// Pending MMIO interrupt bits not yet acknowledged by the guest.
+    pub fn interrupt_status(&self) -> u32 {
+        self.interrupt.status().load(Ordering::SeqCst) as u32
+    }
+
+    pub fn set_restored_interrupt_status(&mut self, status: u32) {
+        self.restored_interrupt_status = status;
+    }
+
+    /// Replay only after vCPU state restore, which replaces previously injected IRQs.
+    pub fn replay_restored_interrupt(&mut self) {
+        let status = std::mem::take(&mut self.restored_interrupt_status);
+        if let Err(error) = self.interrupt.replay(status) {
+            error!("failed to raise a restored device's pending interrupt: {error:?}");
+        }
     }
 
     pub fn locked_device(&self) -> MutexGuard<'_, dyn VirtioDevice + 'static> {
@@ -318,6 +347,37 @@ impl MmioTransport {
         locked_device
             .activate(self.mem.clone(), self.interrupt.clone(), device_queues)
             .expect("Failed to activate device");
+    }
+    /// Re-activate a device past the guest handshake using checkpointed ring positions.
+    pub fn restore_and_activate(
+        &mut self,
+        queue_states: &[Option<QueueState>],
+        acked_features: u64,
+    ) -> Result<(), String> {
+        if self.locked_device().is_activated() {
+            return Err("device is already activated".to_string());
+        }
+        if queue_states.len() != self.queue_config.len() {
+            return Err(format!(
+                "queue count {} differs from device count {}",
+                queue_states.len(),
+                self.queue_config.len()
+            ));
+        }
+        let mut queues = Self::create_queues(&self.queue_config);
+        for (queue, state) in queues.iter_mut().zip(queue_states) {
+            if let Some(state) = state {
+                queue.restore_state(state)?;
+            }
+        }
+        self.locked_device().set_acked_features(acked_features);
+        self.queues = Some(queues);
+        self.device_status = device_status::ACKNOWLEDGE
+            | device_status::DRIVER
+            | device_status::FEATURES_OK
+            | device_status::DRIVER_OK;
+        self.activate();
+        Ok(())
     }
 
     /// Update device status according to the state machine defined by VirtIO Spec 1.0.
@@ -542,6 +602,7 @@ pub(crate) mod tests {
         avail_features: u64,
         device_activated: bool,
         config_bytes: [u8; 0xeff],
+        last_queues: Arc<std::sync::OnceLock<Vec<QueueState>>>,
     }
 
     impl DummyDevice {
@@ -551,6 +612,7 @@ pub(crate) mod tests {
                 avail_features: 0,
                 device_activated: false,
                 config_bytes: [0; 0xeff],
+                last_queues: Arc::new(std::sync::OnceLock::new()),
             }
         }
 
@@ -598,8 +660,11 @@ pub(crate) mod tests {
             &mut self,
             _mem: GuestMemoryMmap,
             _interrupt: InterruptTransport,
-            _queues: Vec<DeviceQueue>,
+            queues: Vec<DeviceQueue>,
         ) -> ActivateResult {
+            let _ = self
+                .last_queues
+                .set(queues.iter().map(|dq| dq.queue.save_state()).collect());
             self.device_activated = true;
             Ok(())
         }
@@ -607,6 +672,105 @@ pub(crate) mod tests {
         fn is_activated(&self) -> bool {
             self.device_activated
         }
+    }
+
+    #[derive(Default)]
+    struct CountingIrqChip(Arc<AtomicUsize>);
+
+    impl crate::bus::BusDevice for CountingIrqChip {}
+
+    #[cfg(target_arch = "aarch64")]
+    impl crate::legacy::gic::GICDevice for CountingIrqChip {
+        fn device_properties(&self) -> Vec<u64> {
+            vec![]
+        }
+        fn vcpu_count(&self) -> u64 {
+            0
+        }
+        fn fdt_compatibility(&self) -> String {
+            "test,gic".into()
+        }
+        fn fdt_maint_irq(&self) -> u32 {
+            0
+        }
+        fn version(&self) -> u32 {
+            0
+        }
+    }
+
+    impl crate::legacy::IrqChipT for CountingIrqChip {
+        fn get_mmio_addr(&self) -> u64 {
+            0
+        }
+        fn get_mmio_size(&self) -> u64 {
+            0
+        }
+        fn set_irq(
+            &self,
+            _irq_line: Option<u32>,
+            _interrupt_evt: Option<&EventFd>,
+        ) -> Result<(), crate::Error> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn checkpoint_restores_queue_positions_and_features() {
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let dummy = DummyDevice::new();
+        let captured_queues = dummy.last_queues.clone();
+        let mut transport =
+            MmioTransport::new(mem, DummyIrqChip::new().into(), Arc::new(Mutex::new(dummy)))
+                .unwrap();
+        let queue = QueueState {
+            size: 16,
+            ready: true,
+            desc_table: 0x1000,
+            avail_ring: 0x2000,
+            used_ring: 0x3000,
+            next_avail: 42,
+            next_used: 40,
+            event_idx_enabled: true,
+            num_added: 2,
+        };
+        let features = 0x55 | (1 << VIRTIO_RING_F_EVENT_IDX);
+        transport
+            .restore_and_activate(&[Some(queue.clone()), None], features)
+            .unwrap();
+        let device = transport.locked_device();
+        assert_eq!(device.acked_features(), features);
+        assert!(device.is_activated());
+        assert_eq!(
+            transport.device_status & device_status::DRIVER_OK,
+            device_status::DRIVER_OK
+        );
+        let mut unconfigured = Queue::new(32);
+        unconfigured.set_event_idx(true);
+        assert_eq!(
+            captured_queues.get().unwrap(),
+            &vec![queue, unconfigured.save_state()]
+        );
+    }
+
+    #[test]
+    fn restored_pending_interrupt_replays_even_if_bit_already_set() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let chip: crate::legacy::IrqChip = Arc::new(Mutex::new(crate::legacy::IrqChipDevice::new(
+            Box::new(CountingIrqChip(count.clone())),
+        )));
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x1000)]).unwrap();
+        let mut transport =
+            MmioTransport::new(mem, chip, Arc::new(Mutex::new(DummyDevice::new()))).unwrap();
+        transport.set_restored_interrupt_status(VIRTIO_MMIO_INT_VRING);
+        transport.replay_restored_interrupt();
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        assert_eq!(transport.interrupt_status(), VIRTIO_MMIO_INT_VRING);
+        transport.replay_restored_interrupt();
+        assert_eq!(count.load(Ordering::SeqCst), 2); // The existing bit still raises the line.
+        transport.interrupt.status().store(0, Ordering::SeqCst);
+        transport.replay_restored_interrupt();
+        assert_eq!(count.load(Ordering::SeqCst), 2);
     }
 
     fn set_device_status(d: &mut MmioTransport, status: u32) {

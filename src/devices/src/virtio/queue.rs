@@ -315,6 +315,20 @@ impl<'a> DescriptorChain<'a> {
     }
 }
 
+/// Runtime queue state; the device supplies the fixed maximum size on restore.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct QueueState {
+    pub size: u16,
+    pub ready: bool,
+    pub desc_table: u64,
+    pub avail_ring: u64,
+    pub used_ring: u64,
+    pub next_avail: u16,
+    pub next_used: u16,
+    pub event_idx_enabled: bool,
+    pub num_added: u16,
+}
+
 #[derive(Debug, Eq, PartialEq)]
 /// A virtio queue's parameters.
 pub struct Queue {
@@ -362,6 +376,39 @@ impl Queue {
             event_idx_enabled: false,
             num_added: Wrapping(0),
         }
+    }
+    /// Preserve mid-stream ring indices so no descriptor is replayed or skipped.
+    pub fn save_state(&self) -> QueueState {
+        QueueState {
+            size: self.size,
+            ready: self.ready,
+            desc_table: self.desc_table.0,
+            avail_ring: self.avail_ring.0,
+            used_ring: self.used_ring.0,
+            next_avail: self.next_avail.0,
+            next_used: self.next_used.0,
+            event_idx_enabled: self.event_idx_enabled,
+            num_added: self.num_added.0,
+        }
+    }
+
+    pub fn restore_state(&mut self, state: &QueueState) -> Result<(), String> {
+        if state.size > self.max_size {
+            return Err(format!(
+                "queue snapshot size {} exceeds device max_size {}",
+                state.size, self.max_size
+            ));
+        }
+        self.size = state.size;
+        self.ready = state.ready;
+        self.desc_table = GuestAddress(state.desc_table);
+        self.avail_ring = GuestAddress(state.avail_ring);
+        self.used_ring = GuestAddress(state.used_ring);
+        self.next_avail = Wrapping(state.next_avail);
+        self.next_used = Wrapping(state.next_used);
+        self.event_idx_enabled = state.event_idx_enabled;
+        self.num_added = Wrapping(state.num_added);
+        Ok(())
     }
 
     pub fn get_max_size(&self) -> u16 {
@@ -1135,5 +1182,36 @@ pub(crate) mod tests {
         let x = vq.used.ring[0].get();
         assert_eq!(x.id, 1);
         assert_eq!(x.len, 0x1000);
+    }
+    #[test]
+    fn checkpoint_preserves_midstream_indices_and_rejects_oversized_queue() {
+        let mut queue = Queue::new(16);
+        queue.size = 8;
+        queue.ready = true;
+        queue.desc_table = GuestAddress(0x1000);
+        queue.avail_ring = GuestAddress(0x2000);
+        queue.used_ring = GuestAddress(0x3000);
+        queue.next_avail = Wrapping(u16::MAX);
+        queue.next_used = Wrapping(u16::MAX - 1);
+        queue.event_idx_enabled = true;
+        queue.num_added = Wrapping(3);
+        let saved = queue.save_state();
+        assert_eq!(saved.next_avail, u16::MAX);
+        assert_eq!(saved.next_used, u16::MAX - 1);
+        assert_eq!(saved.num_added, 3);
+        assert_eq!(
+            (saved.desc_table, saved.avail_ring, saved.used_ring),
+            (0x1000, 0x2000, 0x3000)
+        );
+        let mut restored = Queue::new(16);
+        restored.restore_state(&saved).unwrap();
+        assert_eq!(restored.save_state(), saved);
+        assert_eq!(
+            serde_json::from_slice::<QueueState>(&serde_json::to_vec(&saved).unwrap()).unwrap(),
+            saved
+        );
+        let mut too_small = Queue::new(4);
+        assert!(too_small.restore_state(&saved).is_err());
+        assert_eq!(too_small.save_state(), Queue::new(4).save_state());
     }
 }

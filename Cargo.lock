@@ -781,6 +781,8 @@ dependencies = [
  "nix 0.30.1",
  "rand 0.10.2",
  "rutabaga_gfx",
+ "serde",
+ "serde_json",
  "thiserror 2.0.18",
  "vhost",
  "virtio-bindings",

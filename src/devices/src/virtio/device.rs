@@ -160,6 +160,21 @@ pub trait VirtioDevice: AsAny + Send {
         false
     }
 
+    /// Freeze asynchronous producers after vCPUs have paused so guest memory stops changing.
+    /// Must be idempotent and bounded because this runs on the event-loop thread.
+    fn quiesce_for_snapshot(&mut self) {}
+
+    /// Report a sticky failure to reach a safe checkpoint boundary; reset clears it.
+    fn snapshot_error(&self) -> Option<&str> {
+        None
+    }
+
+    /// Restart producers and replay work deferred during quiescence.
+    fn rearm_after_snapshot(&mut self) {}
+
+    /// Complete device-specific setup once transport queues have been re-activated.
+    fn finish_restore_activation(&mut self) {}
+
     /// Get base and size of the SHM region
     fn shm_region(&self) -> Option<&VirtioShmRegion> {
         None
