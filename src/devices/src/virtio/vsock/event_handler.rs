@@ -29,6 +29,8 @@ impl Vsock {
         let mut raise_irq = false;
         if let Err(e) = self.queue_events[RXQ_INDEX].read() {
             error!("Failed to get vsock rx queue event: {e:?}");
+        } else if self.quiesced {
+            self.deferred_rx = true;
         } else {
             raise_irq |= self.process_stream_rx();
         }
@@ -47,6 +49,9 @@ impl Vsock {
         let mut raise_irq = false;
         if let Err(e) = self.queue_events[TXQ_INDEX].read() {
             error!("Failed to get vsock tx queue event: {e:?}");
+        } else if self.quiesced || self.rx_gate.is_held_for_transport_reset() {
+            // TX may lock a proxy held by an RX producer waiting on the gate.
+            self.deferred_tx = true;
         } else {
             raise_irq |= self.process_stream_tx();
             // The backend may have queued up responses to the packets we sent during
@@ -70,6 +75,17 @@ impl Vsock {
 
         if let Err(e) = self.queue_events[EVQ_INDEX].read() {
             error!("Failed to consume vsock evq event: {e:?}");
+            return false;
+        }
+        if self.quiesced {
+            self.deferred_ev = true;
+            return false;
+        }
+        // The driver refills and kicks EVQ after processing the reset event.
+        if std::mem::take(&mut self.awaiting_transport_reset_ack) {
+            self.rx_gate.release_transport_reset();
+            self.deferred_rx = true;
+            self.process_deferred_queues();
         }
         false
     }
@@ -110,6 +126,20 @@ impl Vsock {
             )
             .unwrap_or_else(|e| {
                 error!("Failed to register vsock txq with event manager: {e:?}");
+            });
+
+        // Restored guests acknowledge a transport reset by kicking EVQ.
+        event_manager
+            .register(
+                self.queue_events[EVQ_INDEX].as_raw_fd(),
+                EpollEvent::new(
+                    EventSet::IN,
+                    self.queue_events[EVQ_INDEX].as_raw_fd() as u64,
+                ),
+                self_subscriber.clone(),
+            )
+            .unwrap_or_else(|e| {
+                error!("Failed to register vsock evq with event manager: {e:?}");
             });
 
         event_manager

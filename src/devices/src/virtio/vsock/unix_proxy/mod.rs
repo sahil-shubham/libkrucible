@@ -3,12 +3,12 @@ use std::num::Wrapping;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use super::super::Queue as VirtQueue;
 use super::defs;
 use super::defs::uapi;
 use super::muxer::{MuxerRx, push_packet};
 use super::muxer_rxq::MuxerRxQ;
 use super::packet::{TsiAcceptReq, TsiConnectReq, TsiListenReq, TsiSendtoAddr, VsockPacket};
+use super::rx_queue::RxQueue;
 
 use super::proxy::{AsRawFd, OwnedFd, Proxy, ProxyError, ProxyStatus, ProxyUpdate, RawFd, RecvPkt};
 
@@ -32,7 +32,7 @@ pub struct UnixProxy {
     pub(crate) fd: OwnedFd,
     pub status: ProxyStatus,
     pub(crate) mem: GuestMemoryMmap,
-    pub(crate) queue: Arc<Mutex<VirtQueue>>,
+    pub(crate) queue: RxQueue,
     pub(crate) rxq: Arc<Mutex<MuxerRxQ>>,
     pub(crate) path: PathBuf,
     pub(crate) peer_port: u32,
@@ -55,7 +55,7 @@ impl UnixProxy {
         local_port: u32,
         control_port: u32,
         mem: GuestMemoryMmap,
-        queue: Arc<Mutex<VirtQueue>>,
+        queue: RxQueue,
         rxq: Arc<Mutex<MuxerRxQ>>,
         path: PathBuf,
     ) -> Result<Self, ProxyError> {
@@ -90,7 +90,7 @@ impl UnixProxy {
         peer_port: u32,
         fd: OwnedFd,
         mem: GuestMemoryMmap,
-        queue: Arc<Mutex<VirtQueue>>,
+        queue: RxQueue,
         rxq: Arc<Mutex<MuxerRxQ>>,
     ) -> Self {
         debug!("new_reverse: id={id} local_port={local_port} peer_port={peer_port}");
@@ -137,7 +137,7 @@ impl UnixProxy {
     pub fn recv_pkt(&mut self) -> (bool, bool) {
         let mut have_used = false;
         let mut wait_credit = false;
-        let mut queue = self.queue.lock().unwrap();
+        let mut queue = self.queue.lock();
 
         while let Some(head) = queue.pop(&self.mem) {
             let len = match VsockPacket::from_rx_virtq_head(&head) {

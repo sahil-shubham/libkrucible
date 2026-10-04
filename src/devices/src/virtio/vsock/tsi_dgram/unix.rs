@@ -29,7 +29,7 @@ pub(crate) fn create(
     family: u16,
     peer_port: u32,
     mem: GuestMemoryMmap,
-    queue: Arc<Mutex<super::super::super::Queue>>,
+    queue: super::super::rx_queue::RxQueue,
     rxq: Arc<Mutex<super::super::muxer_rxq::MuxerRxQ>>,
 ) -> Result<super::TsiDgramProxy, ProxyError> {
     let family = match family {

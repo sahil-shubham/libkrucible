@@ -2,9 +2,9 @@ use std::collections::HashMap;
 use std::num::Wrapping;
 use std::sync::{Arc, Mutex};
 
-use super::super::Queue as VirtQueue;
 use super::muxer_rxq::MuxerRxQ;
 use super::packet::{TsiAcceptReq, TsiConnectReq, TsiListenReq, TsiSendtoAddr, VsockPacket};
+use super::rx_queue::RxQueue;
 
 use super::proxy::{
     AddressFamily, AsRawFd, OwnedFd, Proxy, ProxyError, ProxyStatus, ProxyUpdate, RawFd, RecvPkt,
@@ -34,7 +34,7 @@ pub struct TsiDgramProxy {
     pub(crate) listening: bool,
     pub(crate) family: AddressFamily,
     pub(crate) mem: GuestMemoryMmap,
-    pub(crate) queue: Arc<Mutex<VirtQueue>>,
+    pub(crate) queue: RxQueue,
     pub(crate) rxq: Arc<Mutex<MuxerRxQ>>,
     pub(crate) rx_cnt: Wrapping<u32>,
     pub(crate) tx_cnt: Wrapping<u32>,
@@ -49,7 +49,7 @@ impl TsiDgramProxy {
         family: u16,
         peer_port: u32,
         mem: GuestMemoryMmap,
-        queue: Arc<Mutex<VirtQueue>>,
+        queue: RxQueue,
         rxq: Arc<Mutex<MuxerRxQ>>,
     ) -> Result<Self, ProxyError> {
         sys::create(id, cid, family, peer_port, mem, queue, rxq)
@@ -63,7 +63,7 @@ impl TsiDgramProxy {
     pub(crate) fn recv_pkt(&mut self) -> (bool, bool) {
         let mut have_used = false;
         let mut wait_credit = false;
-        let mut queue = self.queue.lock().unwrap();
+        let mut queue = self.queue.lock();
 
         while let Some(head) = queue.pop(&self.mem) {
             let len = match VsockPacket::from_rx_virtq_head(&head) {

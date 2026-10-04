@@ -3,12 +3,12 @@ use std::num::Wrapping;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use super::super::Queue as VirtQueue;
 use super::defs;
 use super::defs::uapi;
 use super::muxer::{MuxerRx, push_packet};
 use super::muxer_rxq::MuxerRxQ;
 use super::packet::{TsiAcceptReq, TsiConnectReq, TsiListenReq, TsiSendtoAddr, VsockPacket};
+use super::rx_queue::RxQueue;
 
 use super::proxy::{
     AddressFamily, AsRawFd, OwnedFd, Proxy, ProxyError, ProxyRemoval, ProxyStatus, ProxyUpdate,
@@ -39,7 +39,7 @@ pub struct TsiStreamProxy {
     pub(crate) fd: OwnedFd,
     pub status: ProxyStatus,
     pub(crate) mem: GuestMemoryMmap,
-    pub(crate) queue: Arc<Mutex<VirtQueue>>,
+    pub(crate) queue: RxQueue,
     pub(crate) rxq: Arc<Mutex<MuxerRxQ>>,
     pub(crate) rx_cnt: Wrapping<u32>,
     pub(crate) tx_cnt: Wrapping<u32>,
@@ -62,7 +62,7 @@ impl TsiStreamProxy {
         peer_port: u32,
         control_port: u32,
         mem: GuestMemoryMmap,
-        queue: Arc<Mutex<VirtQueue>>,
+        queue: RxQueue,
         rxq: Arc<Mutex<MuxerRxQ>>,
     ) -> Result<Self, ProxyError> {
         let (fd, family) = sys::create_socket(id, family)?;
@@ -102,7 +102,7 @@ impl TsiStreamProxy {
         peer_port: u32,
         fd: OwnedFd,
         mem: GuestMemoryMmap,
-        queue: Arc<Mutex<VirtQueue>>,
+        queue: RxQueue,
         rxq: Arc<Mutex<MuxerRxQ>>,
     ) -> Self {
         debug!("new_reverse: id={id} local_port={local_port} peer_port={peer_port}");
@@ -153,7 +153,7 @@ impl TsiStreamProxy {
     pub(crate) fn recv_pkt(&mut self) -> (bool, bool) {
         let mut have_used = false;
         let mut wait_credit = false;
-        let mut queue = self.queue.lock().unwrap();
+        let mut queue = self.queue.lock();
 
         while let Some(head) = queue.pop(&self.mem) {
             let len = match VsockPacket::from_rx_virtq_head(&head) {

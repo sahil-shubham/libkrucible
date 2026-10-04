@@ -6,7 +6,6 @@ use std::sync::{Arc, Mutex, RwLock};
 #[cfg(windows)]
 use utils::windows::RawFd;
 
-use super::super::Queue as VirtQueue;
 use super::TsiFlags;
 use super::VsockError;
 use super::defs;
@@ -16,6 +15,8 @@ use super::muxer_thread::MuxerThread;
 use super::packet::{TsiConnectReq, TsiGetnameRsp, VsockPacket};
 use super::proxy::{Proxy, ProxyRemoval, ProxyUpdate};
 use super::reaper::ReaperThread;
+use super::rx_queue::RxQueue;
+use super::rx_queue::RxQueueGuard;
 #[cfg(target_os = "macos")]
 use super::timesync::TimesyncThread;
 use super::tsi_dgram::TsiDgramProxy;
@@ -86,10 +87,34 @@ pub fn push_packet(
     cid: u64,
     rx: MuxerRx,
     rxq_mutex: &Arc<Mutex<MuxerRxQ>>,
-    queue_mutex: &Arc<Mutex<VirtQueue>>,
+    queue_mutex: &RxQueue,
     mem: &GuestMemoryMmap,
 ) {
-    let mut queue = queue_mutex.lock().unwrap();
+    deliver_packet(cid, rx, rxq_mutex, queue_mutex.lock(), mem);
+}
+
+/// Guest TX processing is on the event loop; it cannot wait for a paused RX gate.
+fn push_packet_nonblocking(
+    cid: u64,
+    rx: MuxerRx,
+    rxq_mutex: &Arc<Mutex<MuxerRxQ>>,
+    queue: &RxQueue,
+    mem: &GuestMemoryMmap,
+) {
+    if let Some(guard) = queue.try_lock() {
+        deliver_packet(cid, rx, rxq_mutex, guard, mem);
+    } else {
+        rxq_mutex.lock().unwrap().push(rx);
+    }
+}
+
+fn deliver_packet(
+    cid: u64,
+    rx: MuxerRx,
+    rxq_mutex: &Arc<Mutex<MuxerRxQ>>,
+    mut queue: RxQueueGuard<'_>,
+    mem: &GuestMemoryMmap,
+) {
     if let Some(head) = queue.pop(mem) {
         if let Ok(mut pkt) = VsockPacket::from_rx_virtq_head(&head) {
             rx_to_pkt(cid, rx, &mut pkt);
@@ -98,7 +123,6 @@ pub fn push_packet(
             }
         }
     } else {
-        error!("couldn't push pkt to queue, adding it to rxq");
         drop(queue);
         rxq_mutex.lock().unwrap().push(rx);
     }
@@ -107,7 +131,7 @@ pub fn push_packet(
 pub struct VsockMuxer {
     cid: u64,
     host_port_map: Option<HashMap<u16, u16>>,
-    queue: Option<Arc<Mutex<VirtQueue>>>,
+    queue: Option<RxQueue>,
     mem: Option<GuestMemoryMmap>,
     rxq: Arc<Mutex<MuxerRxQ>>,
     epoll: Epoll,
@@ -143,7 +167,7 @@ impl VsockMuxer {
     pub(crate) fn activate(
         &mut self,
         mem: GuestMemoryMmap,
-        queue: Arc<Mutex<VirtQueue>>,
+        queue: RxQueue,
         interrupt: InterruptTransport,
     ) {
         self.queue = Some(queue.clone());
@@ -210,20 +234,7 @@ impl VsockMuxer {
             }
         };
 
-        let mut queue = queue_mutex.lock().unwrap();
-        if let Some(head) = queue.pop(mem) {
-            if let Ok(mut pkt) = VsockPacket::from_rx_virtq_head(&head) {
-                rx_to_pkt(self.cid, rx, &mut pkt);
-                if let Err(e) = queue.add_used(mem, head.index, pkt.hdr().len() as u32 + pkt.len())
-                {
-                    error!("failed to add used elements to the queue: {e:?}");
-                }
-            }
-        } else {
-            error!("couldn't push pkt to queue, adding it to rxq");
-            drop(queue);
-            self.rxq.lock().unwrap().push(rx);
-        }
+        push_packet_nonblocking(self.cid, rx, &self.rxq, queue_mutex, mem);
     }
 
     pub fn update_polling(&self, id: u64, fd: RawFd, evset: EventSet) {
@@ -579,7 +590,7 @@ impl VsockMuxer {
                     local_port: pkt.dst_port(),
                     peer_port: pkt.src_port(),
                 };
-                push_packet(self.cid, rx, &self.rxq, queue, mem);
+                push_packet_nonblocking(self.cid, rx, &self.rxq, queue, mem);
                 return;
             }
             let rxq = self.rxq.clone();
@@ -693,7 +704,7 @@ impl VsockMuxer {
                 local_port: pkt.dst_port(),
                 peer_port: pkt.src_port(),
             };
-            push_packet(self.cid, rx, &self.rxq, queue, mem);
+            push_packet_nonblocking(self.cid, rx, &self.rxq, queue, mem);
         }
     }
 

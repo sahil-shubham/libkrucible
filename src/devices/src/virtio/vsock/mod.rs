@@ -14,6 +14,8 @@ mod muxer_thread;
 mod packet;
 mod proxy;
 mod reaper;
+mod rx_queue;
+mod snapshot_gate;
 #[cfg(target_os = "macos")]
 mod timesync;
 mod tsi_dgram;
@@ -25,7 +27,7 @@ mod windows;
 
 pub use self::defs::TsiFlags;
 pub use self::defs::uapi::VIRTIO_ID_VSOCK as TYPE_VSOCK;
-pub use self::device::Vsock;
+pub use self::device::{Vsock, VsockState};
 
 use bitflags::bitflags;
 use vm_memory::GuestMemoryError;

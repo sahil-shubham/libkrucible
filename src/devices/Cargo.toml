@@ -30,6 +30,7 @@ ffier = { git = "https://github.com/mtjhrc/ffier.git", tag = "0.2.0rc1", optiona
 libc = ">=0.2.39"
 libloading = "0.8"
 log = "0.4.0"
+parking_lot = "0.12"
 rand = "0.10.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

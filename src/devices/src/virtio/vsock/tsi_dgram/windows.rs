@@ -9,7 +9,6 @@ use windows_sys::Win32::Networking::WinSock::{
     send, sendto, socket,
 };
 
-use super::super::super::Queue as VirtQueue;
 use super::super::super::linux_errno::wsa_errno_to_linux;
 use super::super::defs;
 use super::super::defs::uapi;
@@ -53,7 +52,7 @@ pub(crate) fn create(
     family: u16,
     peer_port: u32,
     mem: GuestMemoryMmap,
-    queue: Arc<Mutex<VirtQueue>>,
+    queue: super::super::rx_queue::RxQueue,
     rxq: Arc<Mutex<MuxerRxQ>>,
 ) -> Result<super::TsiDgramProxy, ProxyError> {
     let af = address_family_from_linux(family).ok_or(ProxyError::InvalidFamily)?;

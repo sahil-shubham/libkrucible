@@ -1,10 +1,9 @@
-use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time;
 
-use super::super::Queue as VirtQueue;
 use super::defs::uapi;
 use super::packet::VsockPacket;
+use super::rx_queue::RxQueue;
 
 use crate::virtio::InterruptTransport;
 use vm_memory::GuestMemoryMmap;
@@ -16,7 +15,7 @@ const TSYNC_PORT: u32 = 123;
 pub struct TimesyncThread {
     cid: u64,
     mem: GuestMemoryMmap,
-    queue_mutex: Arc<Mutex<VirtQueue>>,
+    queue_mutex: RxQueue,
     interrupt: InterruptTransport,
 }
 
@@ -24,7 +23,7 @@ impl TimesyncThread {
     pub fn new(
         cid: u64,
         mem: GuestMemoryMmap,
-        queue_mutex: Arc<Mutex<VirtQueue>>,
+        queue_mutex: RxQueue,
         interrupt: InterruptTransport,
     ) -> Self {
         Self {
@@ -36,7 +35,7 @@ impl TimesyncThread {
     }
 
     fn send_time(&self, time: u64) {
-        let mut queue = self.queue_mutex.lock().unwrap();
+        let mut queue = self.queue_mutex.lock();
         if let Some(head) = queue.pop(&self.mem)
             && let Ok(mut pkt) = VsockPacket::from_rx_virtq_head(&head)
         {

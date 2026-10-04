@@ -7,10 +7,10 @@ use std::thread;
 #[cfg(windows)]
 use utils::windows::RawFd;
 
-use super::super::Queue as VirtQueue;
 use super::muxer::{MuxerRx, ProxyMap, push_packet};
 use super::muxer_rxq::MuxerRxQ;
 use super::proxy::{NewProxyType, Proxy, ProxyRemoval, ProxyUpdate};
+use super::rx_queue::RxQueue;
 use super::tsi_stream::TsiStreamProxy;
 
 use crate::virtio::InterruptTransport;
@@ -27,7 +27,7 @@ pub struct MuxerThread {
     rxq: Arc<Mutex<MuxerRxQ>>,
     proxy_map: ProxyMap,
     mem: GuestMemoryMmap,
-    queue: Arc<Mutex<VirtQueue>>,
+    queue: RxQueue,
     interrupt: InterruptTransport,
     reaper_sender: Sender<u64>,
     unix_ipc_port_map: HashMap<u32, (PathBuf, bool)>,
@@ -41,7 +41,7 @@ impl MuxerThread {
         rxq: Arc<Mutex<MuxerRxQ>>,
         proxy_map: ProxyMap,
         mem: GuestMemoryMmap,
-        queue: Arc<Mutex<VirtQueue>>,
+        queue: RxQueue,
         interrupt: InterruptTransport,
         reaper_sender: Sender<u64>,
         unix_ipc_port_map: HashMap<u32, (PathBuf, bool)>,
