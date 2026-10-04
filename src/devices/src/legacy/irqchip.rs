@@ -73,6 +73,11 @@ impl GICDevice for IrqChipDevice {
     fn version(&self) -> u32 {
         self.inner.version()
     }
+
+    #[cfg(target_os = "linux")]
+    fn kvm_device_fd(&self) -> Option<&kvm_ioctls::DeviceFd> {
+        self.inner.kvm_device_fd()
+    }
 }
 
 #[cfg(target_arch = "riscv64")]

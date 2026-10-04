@@ -75,8 +75,10 @@ pub use self::kvmgicv3::KvmGicV3;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub use self::kvmioapic::KvmIoapic;
 #[cfg(target_arch = "aarch64")]
-pub use self::rtc_pl031::RTC;
+pub use self::rtc_pl031::{RTC, RtcState};
 pub use self::serial::Serial;
+#[cfg(target_arch = "aarch64")]
+pub use self::serial::SerialState;
 #[cfg(target_os = "macos")]
 pub use self::vcpu::VcpuList;
 

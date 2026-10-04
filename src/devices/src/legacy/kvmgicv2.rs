@@ -18,7 +18,7 @@ const KVM_VGIC_V2_CPU_SIZE: u64 = 0x2000;
 const ARCH_GIC_V2_MAINT_IRQ: u32 = 8;
 
 pub struct KvmGicV2 {
-    _device_fd: DeviceFd,
+    device_fd: DeviceFd,
 
     /// GIC device properties, to be used for setting up the fdt entry
     properties: [u64; 4],
@@ -76,7 +76,7 @@ impl KvmGicV2 {
         device_fd.set_device_attr(&attr).unwrap();
 
         Self {
-            _device_fd: device_fd,
+            device_fd,
             properties: [dist_addr, dist_size, cpu_addr, cpu_size],
             vcpu_count,
         }
@@ -142,5 +142,9 @@ impl GICDevice for KvmGicV2 {
 
     fn version(&self) -> u32 {
         kvm_bindings::kvm_device_type_KVM_DEV_TYPE_ARM_VGIC_V2
+    }
+
+    fn kvm_device_fd(&self) -> Option<&DeviceFd> {
+        Some(&self.device_fd)
     }
 }

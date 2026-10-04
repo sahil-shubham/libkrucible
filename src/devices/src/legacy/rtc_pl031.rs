@@ -128,6 +128,47 @@ impl RTC {
     }
 }
 
+/// The RTC as a checkpoint holds it. Its time is kept as an offset from the
+/// host's wall clock, so a restored RTC has counted through the time the VM
+/// spent saved, as the guest's other clocks have.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RtcState {
+    /// The RTC's time minus the host's wall-clock time, in ns: zero unless the
+    /// guest set the RTC.
+    pub offset_ns: i64,
+    pub match_value: u32,
+    pub load: u32,
+    pub imsc: u32,
+    pub ris: u32,
+}
+
+impl RTC {
+    fn time_ns(&self) -> i128 {
+        i128::from(self.tick_offset) + Instant::now().duration_since(self.previous_now).as_nanos() as i128
+    }
+
+    pub fn save_state(&self) -> RtcState {
+        let host = i128::from(utils::time::get_time(utils::time::ClockType::Real));
+        RtcState {
+            offset_ns: (self.time_ns() - host) as i64,
+            match_value: self.match_value,
+            load: self.load,
+            imsc: self.imsc,
+            ris: self.ris,
+        }
+    }
+
+    pub fn restore_state(&mut self, state: &RtcState) {
+        self.previous_now = Instant::now();
+        let host = utils::time::get_time(utils::time::ClockType::Real) as i64;
+        self.tick_offset = host.saturating_add(state.offset_ns);
+        self.match_value = state.match_value;
+        self.load = state.load;
+        self.imsc = state.imsc;
+        self.ris = state.ris;
+    }
+}
+
 impl BusDevice for RTC {
     fn read(&mut self, _vcpuid: u64, offset: u64, data: &mut [u8]) {
         let mut read_ok = true;
@@ -237,5 +278,32 @@ mod tests {
         rtc.read(0, AMBA_ID_LOW, &mut data);
         let index = AMBA_ID_LOW + 3;
         assert_eq!(data[0], PL031_ID[((index - AMBA_ID_LOW) >> 2) as usize]);
+    }
+
+    #[test]
+    fn a_restored_rtc_keeps_the_time_the_guest_set_and_counts_on() {
+        let mut rtc = RTC::new(EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap());
+        // The guest sets its RTC a day ahead of the host's clock.
+        let day_ahead = utils::time::get_time(utils::time::ClockType::Real)
+            / utils::time::NANOS_PER_SECOND
+            + 86_400;
+        let mut data = [0; 4];
+        byte_order::write_le_u32(&mut data, day_ahead as u32);
+        rtc.write(0, RTCLR, &data);
+        byte_order::write_le_u32(&mut data, 1);
+        rtc.write(0, RTCIMSC, &data);
+        let state = rtc.save_state();
+        assert!((state.offset_ns - 86_400 * 1_000_000_000).abs() < 2_000_000_000);
+
+        std::thread::sleep(std::time::Duration::from_millis(2_100));
+        let mut fresh = RTC::new(EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap());
+        fresh.restore_state(&state);
+        assert_eq!(fresh.save_state().imsc, 1);
+        fresh.read(0, RTCDR, &mut data);
+        let now = utils::time::get_time(utils::time::ClockType::Real) / utils::time::NANOS_PER_SECOND;
+        // Still a day ahead of the host: it counted through the 2 s it spent
+        // saved, as the host's clock did.
+        let ahead = i64::from(byte_order::read_le_u32(&data)) - now as i64;
+        assert!((86_399..=86_401).contains(&ahead), "{ahead}");
     }
 }

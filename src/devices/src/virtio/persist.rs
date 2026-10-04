@@ -74,6 +74,14 @@ pub struct VmDevicesState {
     pub devices: Vec<DeviceSnapshot>,
     /// Saved MMIO interrupt bits, positionally paired with `devices`.
     pub interrupt_status: Vec<u32>,
+    /// arm64's PL031 real-time clock.
+    #[cfg(target_arch = "aarch64")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rtc: Option<crate::legacy::RtcState>,
+    /// arm64's PL011 UARTs, in registration order.
+    #[cfg(target_arch = "aarch64")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub serials: Vec<crate::legacy::SerialState>,
 }
 
 impl VmDevicesState {
@@ -182,6 +190,7 @@ mod tests {
                 }),
             ],
             interrupt_status: vec![1, 2, 0, 1],
+            ..Default::default()
         };
         let restored = VmDevicesState::from_bytes(&state.to_bytes().unwrap()).unwrap();
         assert_eq!(restored, state);

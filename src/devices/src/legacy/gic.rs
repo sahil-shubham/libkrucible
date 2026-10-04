@@ -13,4 +13,11 @@ pub trait GICDevice {
 
     /// Returns the GIC version of the device
     fn version(&self) -> u32;
+
+    /// The in-kernel vGIC's KVM device, through which a checkpoint saves and
+    /// restores its state. None for a GIC emulated in userspace.
+    #[cfg(target_os = "linux")]
+    fn kvm_device_fd(&self) -> Option<&kvm_ioctls::DeviceFd> {
+        None
+    }
 }

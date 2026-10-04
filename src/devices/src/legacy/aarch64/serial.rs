@@ -316,6 +316,67 @@ impl Serial {
     }
 }
 
+/// The UART's registers and unread input, as a checkpoint holds them; its
+/// host-side input and output are the restoring VMM's own.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SerialState {
+    pub flags: u32,
+    pub lcr: u32,
+    pub rsr: u32,
+    pub cr: u32,
+    pub dmacr: u32,
+    pub debug: u32,
+    pub int_enabled: u32,
+    pub int_level: u32,
+    pub read_fifo: Vec<u8>,
+    pub ilpr: u32,
+    pub ibrd: u32,
+    pub fbrd: u32,
+    pub ifl: u32,
+    pub read_count: u32,
+    pub read_trigger: u32,
+}
+
+impl Serial {
+    pub fn save_state(&self) -> SerialState {
+        SerialState {
+            flags: self.flags,
+            lcr: self.lcr,
+            rsr: self.rsr,
+            cr: self.cr,
+            dmacr: self.dmacr,
+            debug: self.debug,
+            int_enabled: self.int_enabled,
+            int_level: self.int_level,
+            read_fifo: self.read_fifo.iter().copied().collect(),
+            ilpr: self.ilpr,
+            ibrd: self.ibrd,
+            fbrd: self.fbrd,
+            ifl: self.ifl,
+            read_count: self.read_count,
+            read_trigger: self.read_trigger,
+        }
+    }
+
+    pub fn restore_state(&mut self, state: &SerialState) {
+        self.flags = state.flags;
+        self.lcr = state.lcr;
+        self.rsr = state.rsr;
+        self.cr = state.cr;
+        self.dmacr = state.dmacr;
+        self.debug = state.debug;
+        self.int_enabled = state.int_enabled;
+        self.int_level = state.int_level;
+        self.read_fifo = state.read_fifo.iter().copied().collect();
+        self.ilpr = state.ilpr;
+        self.ibrd = state.ibrd;
+        self.fbrd = state.fbrd;
+        self.ifl = state.ifl;
+        self.read_count = state.read_count;
+        self.read_trigger = state.read_trigger;
+    }
+}
+
 impl BusDevice for Serial {
     fn read(&mut self, _base: u64, offset: u64, data: &mut [u8]) {
         debug!("read: offset={offset:x}");
@@ -425,5 +486,38 @@ impl Subscriber for Serial {
             Some(input) => vec![EpollEvent::new(EventSet::IN, input.as_raw_fd() as u64)],
             None => vec![],
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write(uart: &mut Serial, reg: u64, value: u32) {
+        uart.write(0, reg << 2, &value.to_le_bytes());
+    }
+
+    fn read(uart: &mut Serial, reg: u64) -> u32 {
+        let mut data = [0u8; 4];
+        uart.read(0, reg << 2, &mut data);
+        u32::from_le_bytes(data)
+    }
+
+    #[test]
+    fn a_restored_uart_has_the_guests_registers_and_unread_input() {
+        let mut uart = Serial::new_sink(EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap());
+        write(&mut uart, UARTLCR_H, 0x70); // 8 bits, FIFOs on
+        write(&mut uart, UARTIBRD, 13);
+        write(&mut uart, UARTIMSC, PL011_INT_RX | PL011_INT_TX);
+        uart.queue_input_bytes(b"ok").unwrap();
+        let state = uart.save_state();
+
+        let mut fresh = Serial::new_sink(EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap());
+        fresh.restore_state(&state);
+        assert_eq!(fresh.save_state(), state);
+        assert_eq!(read(&mut fresh, UARTIMSC), PL011_INT_RX | PL011_INT_TX);
+        assert_eq!(read(&mut fresh, UARTIBRD), 13);
+        assert_eq!(read(&mut fresh, UARTDR), u32::from(b'o'));
+        assert_eq!(read(&mut fresh, UARTDR), u32::from(b'k'));
     }
 }
