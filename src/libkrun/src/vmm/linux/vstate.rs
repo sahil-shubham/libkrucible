@@ -964,6 +964,20 @@ pub struct Vcpu {
 
     #[cfg(feature = "tee")]
     pm_sender: Sender<WorkerMessage>,
+
+    pause_clock: PauseClock,
+}
+
+/// Guest clock state carried across a live pause, so a paused guest's clocks
+/// don't jump forward by the time it spent paused.
+#[derive(Default)]
+struct PauseClock {
+    /// Set when the vCPU paused from running (not the initial Paused state
+    /// every vCPU starts in), so only a real resume restores the clock.
+    live: bool,
+    /// The guest virtual counter at pause; written back on resume.
+    #[cfg(target_arch = "aarch64")]
+    timer_cnt: u64,
 }
 
 impl Vcpu {
@@ -1096,6 +1110,7 @@ impl Vcpu {
             event_sender: Some(event_sender),
             response_receiver: Some(response_receiver),
             response_sender,
+            pause_clock: PauseClock::default(),
             #[cfg(feature = "tee")]
             pm_sender,
         })
@@ -1125,6 +1140,7 @@ impl Vcpu {
             event_sender: Some(event_sender),
             response_receiver: Some(response_receiver),
             response_sender,
+            pause_clock: PauseClock::default(),
         })
     }
 
@@ -1151,6 +1167,7 @@ impl Vcpu {
             event_sender: Some(event_sender),
             response_receiver: Some(response_receiver),
             response_sender,
+            pause_clock: PauseClock::default(),
         })
     }
 
@@ -1637,13 +1654,10 @@ impl Vcpu {
         match self.event_receiver.try_recv() {
             // Running ---- Pause ----> Paused
             Ok(VcpuEvent::Pause) => {
-                // Nothing special to do.
+                self.save_pause_clock();
                 self.response_sender
                     .send(VcpuResponse::Paused)
                     .expect("failed to send pause status");
-
-                // TODO: we should call `KVM_KVMCLOCK_CTRL` here to make sure
-                // TODO continued: the guest soft lockup watchdog does not panic on Resume.
 
                 // Move to 'paused' state.
                 state = StateMachine::next(Self::paused);
@@ -1665,12 +1679,45 @@ impl Vcpu {
         state
     }
 
+    /// Record what a resume needs to hide the pause from the guest's clocks.
+    /// x86's kvmclock is VM-wide and saved by `Vmm::pause`; arm64's virtual
+    /// counter is per vCPU.
+    fn save_pause_clock(&mut self) {
+        self.pause_clock.live = true;
+        #[cfg(target_arch = "aarch64")]
+        match arch::aarch64::regs::read_timer_cnt(&self.fd) {
+            Ok(cnt) => self.pause_clock.timer_cnt = cnt,
+            Err(e) => {
+                warn!("vcpu {}: reading the virtual counter at pause: {e:?}", self.id);
+                self.pause_clock.live = false;
+            }
+        }
+    }
+
+    /// Undo the pause for the guest's clocks before running again. x86: tell
+    /// the guest its kvmclock was stopped, so its soft-lockup watchdog doesn't
+    /// fire. arm64: put the virtual counter back where it was at pause.
+    fn restore_pause_clock(&mut self) {
+        if !std::mem::take(&mut self.pause_clock.live) {
+            return;
+        }
+        #[cfg(target_arch = "x86_64")]
+        if let Err(e) = self.fd.kvmclock_ctrl() {
+            // EINVAL: the guest hasn't set up a pvclock page; nothing to tell it.
+            debug!("vcpu {}: KVM_KVMCLOCK_CTRL: {e}", self.id);
+        }
+        #[cfg(target_arch = "aarch64")]
+        if let Err(e) = arch::aarch64::regs::write_timer_cnt(&self.fd, self.pause_clock.timer_cnt) {
+            warn!("vcpu {}: restoring the virtual counter at resume: {e:?}", self.id);
+        }
+    }
+
     // This is the main loop of the `Paused` state.
     fn paused(&mut self) -> StateMachine<Self> {
         match self.event_receiver.recv() {
             // Paused ---- Resume ----> Running
             Ok(VcpuEvent::Resume) => {
-                // Nothing special to do.
+                self.restore_pause_clock();
                 self.response_sender
                     .send(VcpuResponse::Resumed)
                     .expect("failed to send resume status");

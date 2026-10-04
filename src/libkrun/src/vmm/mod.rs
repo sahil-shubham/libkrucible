@@ -65,7 +65,7 @@ use kernel::cmdline::Cmdline as KernelCmdline;
 use polly::event_manager::{EventManager, Subscriber};
 use utils::epoll::{EpollEvent, EventSet};
 use utils::eventfd::EventFd;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use utils::pollable_channel::{PollableChannelReciever, PollableChannelSender};
 use vm_memory::GuestMemoryMmap;
 
@@ -163,22 +163,28 @@ pub struct Vmm {
     // the requests in the order they were made. Device worker threads are
     // notify-driven, so a frozen guest leaves them idle without explicit
     // handling.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     pub(crate) vm_ctl_tx: PollableChannelSender<VmCtl>,
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     pub(crate) vm_ctl_rx: PollableChannelReciever<VmCtl>,
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     pub(crate) paused: bool,
+    /// The VM-wide kvmclock at pause, restored on resume so the guest's clock
+    /// doesn't jump by the time spent paused.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    pub(crate) paused_clock: Option<kvm_bindings::kvm_clock_data>,
     #[cfg(target_os = "macos")]
     pub(crate) paused_at: u64,
 }
 
 /// Out-of-band request to the running VM's event loop.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[derive(Debug, Clone)]
 pub enum VmCtl {
-    Pause,
-    Resume,
+    /// Pause; the outcome is sent back once every vCPU is parked.
+    Pause(crossbeam_channel::Sender<std::result::Result<(), String>>),
+    /// Resume; the outcome is sent back once every vCPU is running again.
+    Resume(crossbeam_channel::Sender<std::result::Result<(), String>>),
 }
 
 impl Vmm {
@@ -249,7 +255,7 @@ impl Vmm {
 
     /// Sender for live [`VmCtl`] requests. The event loop runs [`Vmm::pause`] /
     /// [`Vmm::resume`] in response.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     pub fn vm_ctl_sender(&self) -> PollableChannelSender<VmCtl> {
         self.vm_ctl_tx.clone()
     }
@@ -292,6 +298,71 @@ impl Vmm {
         let paused_ticks = unsafe { hvf::mach_absolute_time() }.saturating_sub(self.paused_at);
         for h in &self.vcpus_handles {
             h.send_event(VcpuEvent::Resume(paused_ticks))
+                .map_err(|e| format!("vcpu resume event: {e:?}"))?;
+        }
+        for h in &self.vcpus_handles {
+            match h.response_receiver().recv() {
+                Ok(VcpuResponse::Resumed) => {}
+                Ok(other) => return Err(format!("unexpected vcpu response: {other:?}")),
+                Err(e) => return Err(format!("vcpu response: {e:?}")),
+            }
+        }
+        self.paused = false;
+        Ok(())
+    }
+
+    /// Freeze every vCPU at an instruction boundary (each is kicked out of
+    /// KVM_RUN by its signal). Reversible via [`Vmm::resume`]; the guest's
+    /// clocks are held across the pause. Idempotent.
+    #[cfg(target_os = "linux")]
+    pub fn pause(&mut self) -> std::result::Result<(), String> {
+        if self.paused {
+            return Ok(());
+        }
+        for h in &self.vcpus_handles {
+            h.send_event(VcpuEvent::Pause)
+                .map_err(|e| format!("vcpu pause event: {e:?}"))?;
+        }
+        for h in &self.vcpus_handles {
+            match h.response_receiver().recv() {
+                Ok(VcpuResponse::Paused) => {}
+                Ok(other) => return Err(format!("unexpected vcpu response: {other:?}")),
+                Err(e) => return Err(format!("vcpu response: {e:?}")),
+            }
+        }
+        // kvmclock is VM-wide on x86 (arm64's counter is saved per vCPU).
+        #[cfg(target_arch = "x86_64")]
+        {
+            self.paused_clock = Some(
+                self.vm
+                    .fd()
+                    .get_clock()
+                    .map_err(|e| format!("KVM_GET_CLOCK: {e}"))?,
+            );
+        }
+        self.paused = true;
+        Ok(())
+    }
+
+    /// Wake every vCPU frozen by [`Vmm::pause`], with the guest's clocks
+    /// continuing from where they stopped. Idempotent.
+    #[cfg(target_os = "linux")]
+    pub fn resume(&mut self) -> std::result::Result<(), String> {
+        if !self.paused {
+            return Ok(());
+        }
+        #[cfg(target_arch = "x86_64")]
+        if let Some(mut clock) = self.paused_clock.take() {
+            // Only the clock value is restored; the flags KVM_GET_CLOCK
+            // reports (e.g. TSC-stable) aren't valid input to KVM_SET_CLOCK.
+            clock.flags = 0;
+            self.vm
+                .fd()
+                .set_clock(&clock)
+                .map_err(|e| format!("KVM_SET_CLOCK: {e}"))?;
+        }
+        for h in &self.vcpus_handles {
+            h.send_event(VcpuEvent::Resume)
                 .map_err(|e| format!("vcpu resume event: {e:?}"))?;
         }
         for h in &self.vcpus_handles {
@@ -437,16 +508,18 @@ impl Subscriber for Vmm {
         let source = event.fd();
         let event_set = event.event_set();
 
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         if source == self.vm_ctl_rx.as_raw_fd() && event_set == EventSet::IN {
             while let Ok(Some(req)) = self.vm_ctl_rx.try_recv() {
-                let res = match req {
-                    VmCtl::Pause => self.pause(),
-                    VmCtl::Resume => self.resume(),
+                let (op, res, reply) = match req {
+                    VmCtl::Pause(reply) => ("pause", self.pause(), reply),
+                    VmCtl::Resume(reply) => ("resume", self.resume(), reply),
                 };
-                if let Err(e) = res {
-                    error!("vm {req:?} failed: {e}");
+                if let Err(e) = &res {
+                    error!("vm {op} failed: {e}");
                 }
+                // The caller may have given up waiting; nothing to do then.
+                let _ = reply.send(res);
             }
             return;
         }
@@ -483,13 +556,13 @@ impl Subscriber for Vmm {
     }
 
     fn interest_list(&self) -> Vec<EpollEvent> {
-        // `vm_ctl_rx` is pushed only on macOS, so `mut` is unused elsewhere.
+        // `vm_ctl_rx` is pushed only on macOS and Linux, so `mut` is unused elsewhere.
         #[allow(unused_mut)]
         let mut list = vec![EpollEvent::new(
             EventSet::IN,
             self.exit_evt.as_raw_fd() as u64,
         )];
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         list.push(EpollEvent::new(
             EventSet::IN,
             self.vm_ctl_rx.as_raw_fd() as u64,

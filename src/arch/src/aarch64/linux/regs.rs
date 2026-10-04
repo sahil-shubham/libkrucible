@@ -25,6 +25,8 @@ pub enum Error {
     SetCoreRegister(kvm_ioctls::Error),
     /// Failed to get a system register.
     GetSysRegister(kvm_ioctls::Error),
+    /// Failed to set a system register.
+    SetSysRegister(kvm_ioctls::Error),
     /// The value returned for the MPIDR register is bigger than 64 bits.
     MpidrTooBig(TryFromIntError),
 }
@@ -144,6 +146,27 @@ pub fn read_mpidr(vcpu: &VcpuFd) -> Result<u64> {
     vcpu.get_one_reg(MPIDR_EL1, &mut data)
         .map_err(Error::GetSysRegister)?;
     Ok(u64::from_le_bytes(data))
+}
+
+// KVM's id for the guest virtual counter (CNTVCT_EL0). The kernel's encoding
+// is ARM64_SYS_REG(3, 3, 14, 3, 2), not CNTVCT_EL0's architectural encoding.
+// https://elixir.bootlin.com/linux/v6.8/source/arch/arm64/include/uapi/asm/kvm.h#L261
+arm64_sys_reg!(KVM_REG_ARM_TIMER_CNT, 3, 3, 14, 3, 2);
+
+/// Read the guest's virtual counter for this vCPU.
+pub fn read_timer_cnt(vcpu: &VcpuFd) -> Result<u64> {
+    let mut data = [0u8; 8];
+    vcpu.get_one_reg(KVM_REG_ARM_TIMER_CNT, &mut data)
+        .map_err(Error::GetSysRegister)?;
+    Ok(u64::from_le_bytes(data))
+}
+
+/// Set the guest's virtual counter for this vCPU. KVM adjusts the vCPU's
+/// counter offset so the guest reads `value` from now on.
+pub fn write_timer_cnt(vcpu: &VcpuFd, value: u64) -> Result<()> {
+    vcpu.set_one_reg(KVM_REG_ARM_TIMER_CNT, &value.to_le_bytes())
+        .map_err(Error::SetSysRegister)?;
+    Ok(())
 }
 
 #[cfg(test)]

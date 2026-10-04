@@ -1228,7 +1228,7 @@ pub fn build_microvm(
     // We use this atomic to record the exit code set by init/init.c in the VM.
     let exit_code = Arc::new(AtomicI32::new(i32::MAX));
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     let (vm_ctl_tx, vm_ctl_rx) = utils::pollable_channel::pollable_channel()
         .map_err(Error::EventFd)
         .map_err(StartMicrovmError::Internal)?;
@@ -1243,12 +1243,14 @@ pub fn build_microvm(
         exit_code: exit_code.clone(),
         vm,
         mmio_device_manager,
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         vm_ctl_tx,
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         vm_ctl_rx,
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         paused: false,
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        paused_clock: None,
         #[cfg(target_os = "macos")]
         paused_at: 0,
     };

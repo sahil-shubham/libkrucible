@@ -3,7 +3,7 @@ use std::marker::PhantomData;
 use std::os::fd::{AsRawFd, BorrowedFd};
 use std::sync::{Arc, Mutex};
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use crate::vmm::VmCtl;
 use crate::vmm::Vmm as InnerVmm;
 #[cfg(unix)]
@@ -14,7 +14,7 @@ use crossbeam_channel::unbounded;
 use polly::event_manager::EventManager;
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
 use utils::eventfd::EventFd;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use utils::pollable_channel::PollableChannelSender;
 
 use super::device_builders::{DeviceManager, MmioDeviceManager};
@@ -170,7 +170,7 @@ pub struct Vmm<'a> {
 // so that run() returns a RunningVmm with wait(). Then this handle
 // can be obtained from RunningVmm instead of requiring a pre-run call.
 pub struct VmmHandle {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     vm_ctl_tx: PollableChannelSender<VmCtl>,
     #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
     shutdown_efd: Option<EventFd>,
@@ -179,7 +179,7 @@ pub struct VmmHandle {
 impl Clone for VmmHandle {
     fn clone(&self) -> Self {
         Self {
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
             vm_ctl_tx: self.vm_ctl_tx.clone(),
             #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
             shutdown_efd: self
@@ -190,27 +190,45 @@ impl Clone for VmmHandle {
     }
 }
 
+impl VmmHandle {
+    /// Send a pause/resume request to the VMM's event loop and wait for its
+    /// outcome, so a successful return means the vCPUs are actually parked
+    /// (or running again).
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn vm_ctl(
+        &self,
+        req: fn(crossbeam_channel::Sender<Result<(), String>>) -> VmCtl,
+        op: &str,
+    ) -> Result<(), VmmError> {
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        self.vm_ctl_tx
+            .send(req(tx))
+            .map_err(|e| VmmError::Internal(format!("{op}: {e}")))?;
+        match rx.recv_timeout(std::time::Duration::from_secs(10)) {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => Err(VmmError::Internal(format!("{op}: {e}"))),
+            Err(e) => Err(VmmError::Internal(format!("{op}: no answer from the VMM: {e}"))),
+        }
+    }
+}
+
 #[cfg_attr(feature = "ffi", ffier::export)]
 impl VmmHandle {
     pub fn pause(&self) -> Result<(), VmmError> {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         {
-            self.vm_ctl_tx
-                .send(VmCtl::Pause)
-                .map_err(|e| VmmError::Internal(format!("pause: {e}")))
+            self.vm_ctl(VmCtl::Pause, "pause")
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         Err(VmmError::FeatureDisabled())
     }
 
     pub fn resume(&self) -> Result<(), VmmError> {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         {
-            self.vm_ctl_tx
-                .send(VmCtl::Resume)
-                .map_err(|e| VmmError::Internal(format!("resume: {e}")))
+            self.vm_ctl(VmCtl::Resume, "resume")
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         Err(VmmError::FeatureDisabled())
     }
 
@@ -245,13 +263,13 @@ impl<'a> Vmm<'a> {
     pub fn handle(&self) -> Result<VmmHandle, VmmError> {
         match &self.inner {
             VmmInner::Vmm {
-                #[cfg(target_os = "macos")]
+                #[cfg(any(target_os = "macos", target_os = "linux"))]
                 vmm,
                 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
                 shutdown_efd,
                 ..
             } => Ok(VmmHandle {
-                #[cfg(target_os = "macos")]
+                #[cfg(any(target_os = "macos", target_os = "linux"))]
                 vm_ctl_tx: vmm.lock().unwrap().vm_ctl_sender(),
                 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
                 shutdown_efd: shutdown_efd
