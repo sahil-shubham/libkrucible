@@ -52,10 +52,14 @@ use kvm_bindings::kvm_userspace_memory_region;
 use kvm_bindings::{CpuId, KVM_MAX_CPUID_ENTRIES, MsrList};
 #[cfg(checkpoint)]
 use kvm_bindings::{
-    KVM_CLOCK_TSC_STABLE, KVM_IRQCHIP_IOAPIC, KVM_IRQCHIP_PIC_MASTER, KVM_IRQCHIP_PIC_SLAVE, Msrs,
-    kvm_clock_data, kvm_cpuid_entry2, kvm_debugregs, kvm_irqchip, kvm_lapic_state, kvm_mp_state,
-    kvm_msr_entry, kvm_pit_state2, kvm_regs, kvm_sregs, kvm_vcpu_events, kvm_xcrs, kvm_xsave,
+    KVM_CLOCK_HOST_TSC, KVM_CLOCK_REALTIME, KVM_CLOCK_TSC_STABLE, KVM_IRQCHIP_IOAPIC,
+    KVM_IRQCHIP_PIC_MASTER, KVM_IRQCHIP_PIC_SLAVE, KVM_VCPU_TSC_CTRL, KVM_VCPU_TSC_OFFSET, KVMIO,
+    Msrs, kvm_clock_data, kvm_cpuid_entry2, kvm_debugregs, kvm_device_attr, kvm_irqchip,
+    kvm_lapic_state, kvm_mp_state, kvm_msr_entry, kvm_pit_state2, kvm_regs, kvm_sregs,
+    kvm_vcpu_events, kvm_xcrs, kvm_xsave,
 };
+#[cfg(checkpoint)]
+use vmm_sys_util::ioctl::ioctl_with_ref;
 use kvm_bindings::{KVM_API_VERSION, KVM_SYSTEM_EVENT_RESET, KVM_SYSTEM_EVENT_SHUTDOWN};
 #[cfg(feature = "tee")]
 use kvm_bindings::{KVM_CAP_EXIT_HYPERCALL, KVM_MEMORY_EXIT_FLAG_PRIVATE, kvm_enable_cap};
@@ -79,6 +83,15 @@ use super::tee::amdsnp::launch as snp;
 
 /// Signal number (SIGRTMIN) used to kick Vcpus.
 pub(crate) const VCPU_RTSIG_OFFSET: i32 = 0;
+
+// kvm-ioctls wraps the vCPU device-attribute API only for arm64/riscv64; x86
+// needs it for the TSC offset.
+#[cfg(checkpoint)]
+vmm_sys_util::ioctl_iow_nr!(KVM_SET_DEVICE_ATTR, KVMIO, 0xe1, kvm_device_attr);
+#[cfg(checkpoint)]
+vmm_sys_util::ioctl_iow_nr!(KVM_GET_DEVICE_ATTR, KVMIO, 0xe2, kvm_device_attr);
+#[cfg(checkpoint)]
+vmm_sys_util::ioctl_iow_nr!(KVM_HAS_DEVICE_ATTR, KVMIO, 0xe3, kvm_device_attr);
 
 /// Errors associated with the wrappers over KVM ioctls.
 #[allow(dead_code)]
@@ -222,6 +235,15 @@ pub enum Error {
         actual: usize,
         first_failed: u32,
     },
+    #[cfg(checkpoint)]
+    /// Failed to get or set a vCPU's TSC frequency.
+    VcpuTscKhz(kvm_ioctls::Error),
+    #[cfg(checkpoint)]
+    /// Failed to get or set a vCPU's TSC offset (KVM_VCPU_TSC_OFFSET).
+    VcpuTscOffset(kvm_ioctls::Error),
+    #[cfg(checkpoint)]
+    /// The guest clock can't be saved or carried across a restore.
+    VmClock(String),
     /// Cannot spawn a new vCPU thread.
     VcpuSpawn(io::Error),
     /// Cannot cleanly initialize vcpu TLS.
@@ -389,6 +411,12 @@ impl Display for Error {
                 f,
                 "KVM handled only {actual} of {expected} vCPU MSRs (stopped at MSR {first_failed:#x})"
             ),
+            #[cfg(checkpoint)]
+            VcpuTscKhz(e) => write!(f, "KVM vCPU TSC frequency: {e}"),
+            #[cfg(checkpoint)]
+            VcpuTscOffset(e) => write!(f, "KVM vCPU TSC offset: {e}"),
+            #[cfg(checkpoint)]
+            VmClock(e) => write!(f, "guest clock: {e}"),
             VcpuSpawn(e) => write!(f, "Cannot spawn a new vCPU thread: {e}"),
             VcpuTlsInit => write!(f, "Cannot clean init vcpu TLS"),
             VcpuTlsNotPresent => write!(f, "Vcpu not present in TLS"),
@@ -866,8 +894,21 @@ impl Vm {
     pub fn save_state(&self) -> Result<VmState> {
         let pitstate = self.fd.get_pit2().map_err(Error::VmGetPit2)?;
 
+        let before = realtime_ns()?;
         let mut clock = self.fd.get_clock().map_err(Error::VmGetClock)?;
-        // This bit is not accepted in SET_CLOCK, clear it.
+        let after = realtime_ns()?;
+        // The wall-clock time paired with the kvmclock is what lets a restore
+        // (KVM_SET_CLOCK with KVM_CLOCK_REALTIME) move the guest's clock on by
+        // the time the VM spent saved, instead of resuming it in the past.
+        // KVM only pairs them itself while its master clock is in use, and a
+        // KVM_SET_CLOCK can turn that off, so a restored VM would become
+        // unsaveable. The vCPUs are parked, so bracketing the read is exact
+        // enough.
+        if clock.flags & KVM_CLOCK_REALTIME == 0 {
+            clock.realtime = midpoint(before, after)?;
+            clock.flags |= KVM_CLOCK_REALTIME;
+        }
+        // Only valid as KVM_GET_CLOCK output.
         clock.flags &= !KVM_CLOCK_TSC_STABLE;
 
         let mut pic_master = kvm_irqchip {
@@ -904,7 +945,8 @@ impl Vm {
     }
 
     #[cfg(checkpoint)]
-    /// Restores the Kvm Vm state.
+    /// Restores the VM-wide state. The kvmclock moves on by the wall-clock
+    /// time since the save (the saved clock carries KVM_CLOCK_REALTIME).
     pub fn restore_state(&self, state: &VmState) -> Result<()> {
         self.fd
             .set_pit2(&state.pitstate)
@@ -919,6 +961,49 @@ impl Vm {
         self.fd
             .set_irqchip(&state.ioapic)
             .map_err(Error::VmSetIrqChip)?;
+        Ok(())
+    }
+
+    #[cfg(checkpoint)]
+    /// After [`Self::restore_state`] moved the guest's kvmclock on by the time
+    /// the VM spent saved, move each vCPU's TSC on by the same amount. Left
+    /// alone, the TSC would resume where it stopped, behind the guest's own
+    /// clock.
+    ///
+    /// With KVM's paired (clock, host TSC) samples from both ends this is the
+    /// KVM migration relation, exact for every vCPU:
+    /// `offset' = offset - (clock_saved - clock_now) * kHz + (host_tsc_saved - host_tsc_now)`.
+    /// Without them, the saved IA32_TSC is advanced by the clock delta instead.
+    pub fn rebase_vcpu_tsc(&self, saved: &VmState, vcpus: &mut [VcpuState]) -> Result<()> {
+        let now = self.fd.get_clock().map_err(Error::VmGetClock)?;
+        let samples = saved.clock.flags & now.flags & KVM_CLOCK_HOST_TSC != 0;
+        let elapsed_ns = i128::from(now.clock) - i128::from(saved.clock.clock);
+        for state in vcpus {
+            let tsc = &mut state.tsc;
+            match tsc.offset {
+                Some(offset) if samples => {
+                    tsc.offset = Some(rebased_tsc_offset(
+                        offset,
+                        tsc.khz,
+                        saved.clock.clock,
+                        now.clock,
+                        saved.clock.host_tsc,
+                        now.host_tsc,
+                    ));
+                    tsc.apply_offset = true;
+                }
+                _ => {
+                    let entry = state
+                        .msrs
+                        .as_mut_slice()
+                        .iter_mut()
+                        .find(|e| e.index == arch_gen::x86::msr_index::MSR_IA32_TSC)
+                        .ok_or_else(|| Error::VmClock("vCPU state lacks IA32_TSC".into()))?;
+                    entry.data = advance_tsc(entry.data, elapsed_ns, tsc.khz);
+                    tsc.apply_offset = false;
+                }
+            }
+        }
         Ok(())
     }
 }
@@ -971,6 +1056,66 @@ mod pod {
     unsafe impl Pod for kvm_vcpu_events {}
     unsafe impl Pod for kvm_xcrs {}
     unsafe impl Pod for kvm_xsave {}
+}
+
+/// The vCPU device attribute holding KVM's guest TSC offset; `addr` is where
+/// KVM reads or writes the u64.
+#[cfg(checkpoint)]
+fn tsc_offset_attr(addr: u64) -> kvm_device_attr {
+    kvm_device_attr {
+        group: KVM_VCPU_TSC_CTRL,
+        attr: u64::from(KVM_VCPU_TSC_OFFSET),
+        addr,
+        flags: 0,
+    }
+}
+
+#[cfg(checkpoint)]
+fn realtime_ns() -> Result<u64> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| Error::VmClock(format!("host clock is before 1970: {e}")))?;
+    u64::try_from(now.as_nanos()).map_err(|_| Error::VmClock("host clock overflows u64 ns".into()))
+}
+
+/// The midpoint of two CLOCK_REALTIME reads taken around KVM_GET_CLOCK.
+#[cfg(checkpoint)]
+fn midpoint(before: u64, after: u64) -> Result<u64> {
+    // Wider than a descheduled thread needs, narrow enough to matter.
+    const MAX_WINDOW_NS: u64 = 100_000_000;
+    let window = after.checked_sub(before).ok_or_else(|| {
+        Error::VmClock("host wall clock stepped back while sampling the kvmclock".into())
+    })?;
+    if window > MAX_WINDOW_NS {
+        return Err(Error::VmClock(format!(
+            "sampling the kvmclock took {window} ns"
+        )));
+    }
+    Ok(before + window / 2)
+}
+
+/// The KVM migration relation for a vCPU's TSC offset (wrapping arithmetic:
+/// offsets and TSCs are u64 modulo 2^64).
+#[cfg(checkpoint)]
+fn rebased_tsc_offset(
+    offset: u64,
+    khz: u32,
+    saved_clock_ns: u64,
+    now_clock_ns: u64,
+    saved_host_tsc: u64,
+    now_host_tsc: u64,
+) -> u64 {
+    let guest_ticks = i128::from(now_clock_ns) - i128::from(saved_clock_ns);
+    let guest_ticks = guest_ticks * i128::from(khz) / 1_000_000;
+    offset
+        .wrapping_add(guest_ticks.rem_euclid(1 << 64) as u64)
+        .wrapping_sub(now_host_tsc.wrapping_sub(saved_host_tsc))
+}
+
+#[cfg(checkpoint)]
+fn advance_tsc(tsc: u64, elapsed_ns: i128, khz: u32) -> u64 {
+    let ticks = elapsed_ns * i128::from(khz) / 1_000_000;
+    tsc.wrapping_add(ticks.rem_euclid(1 << 64) as u64)
 }
 
 /// Encapsulates configuration parameters for the guest vCPUS.
@@ -1451,6 +1596,7 @@ impl Vcpu {
         let xcrs = self.fd.get_xcrs().map_err(Error::VcpuGetXcrs)?;
         let debug_regs = self.fd.get_debug_regs().map_err(Error::VcpuGetDebugRegs)?;
         let lapic = self.fd.get_lapic().map_err(Error::VcpuGetLapic)?;
+        let tsc = self.save_tsc()?;
         let nmsrs = self.fd.get_msrs(&mut msrs).map_err(Error::VcpuGetMsrs)?;
         msrs_complete(&msrs, nmsrs)?;
         let vcpu_events = self
@@ -1468,6 +1614,7 @@ impl Vcpu {
             vcpu_events,
             xcrs,
             xsave,
+            tsc,
         })
     }
 
@@ -1495,6 +1642,12 @@ impl Vcpu {
          * SET_LAPIC must come before SET_MSRS, because the TSC deadline MSR
          * only restores successfully, when the LAPIC is correctly configured.
          */
+        // The guest's clocks were calibrated against this TSC rate.
+        if self.fd.get_tsc_khz().map_err(Error::VcpuTscKhz)? != state.tsc.khz {
+            self.fd
+                .set_tsc_khz(state.tsc.khz)
+                .map_err(Error::VcpuTscKhz)?;
+        }
         self.fd
             .set_cpuid2(&state.cpuid)
             .map_err(Error::VcpuSetCpuid)?;
@@ -1523,9 +1676,51 @@ impl Vcpu {
         // A partial restore would resume the guest with some MSRs (say, the
         // kvmclock page or the syscall entry) silently left at reset values.
         msrs_complete(&state.msrs, nmsrs)?;
+        // Writing IA32_TSC above set KVM's offset so the guest TSC reads the
+        // saved value; the rebased offset (see Vm::rebase_vcpu_tsc) replaces
+        // it with one that kept counting through the gap.
+        if let (true, Some(offset)) = (state.tsc.apply_offset, state.tsc.offset) {
+            self.set_tsc_offset(offset)?;
+        }
         self.fd
             .set_vcpu_events(&state.vcpu_events)
             .map_err(Error::VcpuSetVcpuEvents)?;
+        Ok(())
+    }
+
+    #[cfg(checkpoint)]
+    fn save_tsc(&self) -> Result<TscState> {
+        let khz = self.fd.get_tsc_khz().map_err(Error::VcpuTscKhz)?;
+        let mut offset = 0u64;
+        let attr = tsc_offset_attr(&mut offset as *mut u64 as u64);
+        // SAFETY: the attribute struct is valid for the call; HAS only checks
+        // that the attribute exists.
+        let has = unsafe { ioctl_with_ref(&self.fd, KVM_HAS_DEVICE_ATTR(), &attr) } == 0;
+        let offset = if has {
+            // SAFETY: `attr.addr` points at `offset`, which outlives the call;
+            // KVM writes exactly one u64 there.
+            if unsafe { ioctl_with_ref(&self.fd, KVM_GET_DEVICE_ATTR(), &attr) } < 0 {
+                return Err(Error::VcpuTscOffset(kvm_ioctls::Error::last()));
+            }
+            Some(offset)
+        } else {
+            None
+        };
+        Ok(TscState {
+            khz,
+            offset,
+            apply_offset: offset.is_some(),
+        })
+    }
+
+    #[cfg(checkpoint)]
+    fn set_tsc_offset(&self, offset: u64) -> Result<()> {
+        let attr = tsc_offset_attr(&offset as *const u64 as u64);
+        // SAFETY: `attr.addr` points at `offset`, which outlives the call; KVM
+        // reads exactly one u64 there.
+        if unsafe { ioctl_with_ref(&self.fd, KVM_SET_DEVICE_ATTR(), &attr) } < 0 {
+            return Err(Error::VcpuTscOffset(kvm_ioctls::Error::last()));
+        }
         Ok(())
     }
 
@@ -1901,6 +2096,21 @@ pub struct VcpuState {
     vcpu_events: kvm_vcpu_events,
     xcrs: kvm_xcrs,
     xsave: kvm_xsave,
+    tsc: TscState,
+}
+
+/// A vCPU's TSC as KVM runs it.
+#[cfg(checkpoint)]
+#[derive(Clone, Copy)]
+struct TscState {
+    /// The guest TSC rate.
+    khz: u32,
+    /// KVM's offset of the guest TSC from the host's (KVM_VCPU_TSC_OFFSET),
+    /// where the host has it (Linux 5.16+).
+    offset: Option<u64>,
+    /// Write `offset` after the MSRs on restore; false when the IA32_TSC
+    /// value in the MSRs was rebased instead.
+    apply_offset: bool,
 }
 
 #[cfg(checkpoint)]
@@ -1924,6 +2134,14 @@ impl VcpuState {
         enc.pod(&self.vcpu_events);
         enc.pod(&self.xcrs);
         enc.pod(&self.xsave);
+        enc.u32(self.tsc.khz);
+        match self.tsc.offset {
+            Some(offset) => {
+                enc.u32(1);
+                enc.u64(offset);
+            }
+            None => enc.u32(0),
+        }
     }
 
     pub(crate) fn decode(dec: &mut Decoder) -> std::result::Result<Self, String> {
@@ -1942,6 +2160,19 @@ impl VcpuState {
             vcpu_events: dec.pod()?,
             xcrs: dec.pod()?,
             xsave: dec.pod()?,
+            tsc: {
+                let khz = dec.u32()?;
+                let offset = match dec.u32()? {
+                    0 => None,
+                    1 => Some(dec.u64()?),
+                    n => return Err(format!("corrupt TSC offset marker {n}")),
+                };
+                TscState {
+                    khz,
+                    offset,
+                    apply_offset: offset.is_some(),
+                }
+            },
         })
     }
 }
@@ -2466,5 +2697,95 @@ mod tests {
         };
         vm2.fd.get_irqchip(&mut got).unwrap();
         assert_eq!(unsafe { got.chip.ioapic.redirtbl[5].bits }, 0x31);
+    }
+
+    #[cfg(checkpoint)]
+    fn guest_tsc(vcpu: &Vcpu) -> u64 {
+        let mut msrs = Msrs::from_entries(&[kvm_msr_entry {
+            index: arch_gen::x86::msr_index::MSR_IA32_TSC,
+            ..Default::default()
+        }])
+        .unwrap();
+        assert_eq!(vcpu.fd.get_msrs(&mut msrs).unwrap(), 1);
+        msrs.as_slice()[0].data
+    }
+
+    /// A restore some time after the save must move the guest's kvmclock and
+    /// every vCPU's TSC on by that time, together: a guest whose clock jumps
+    /// while its TSC doesn't sees time and its timers disagree.
+    #[cfg(checkpoint)]
+    #[test]
+    fn restore_moves_guest_clock_and_tsc_on_by_the_gap() {
+        let (vm, vcpu, _mem, _) = distinctive_vcpu();
+        let vm_state = vm.save_state().unwrap();
+        assert_ne!(vm_state.clock.flags & KVM_CLOCK_REALTIME, 0);
+        let vcpu_state = vcpu.save_state().unwrap();
+        let saved_tsc = vcpu_state
+            .msrs
+            .as_slice()
+            .iter()
+            .find(|e| e.index == arch_gen::x86::msr_index::MSR_IA32_TSC)
+            .unwrap()
+            .data;
+        drop(vcpu);
+        drop(vm);
+
+        let gap_ms: u64 = 500;
+        std::thread::sleep(std::time::Duration::from_millis(gap_ms));
+
+        let (vm2, mut fresh, _mem2) = setup_vcpu(0x10000);
+        vm2.restore_state(&vm_state).unwrap();
+        let mut states = vec![vcpu_state];
+        vm2.rebase_vcpu_tsc(&vm_state, &mut states).unwrap();
+        fresh.restore_state(states.pop().unwrap()).unwrap();
+
+        let clock_ms = (vm2.fd.get_clock().unwrap().clock - vm_state.clock.clock) / 1_000_000;
+        let khz = u64::from(fresh.fd.get_tsc_khz().unwrap());
+        let tsc_ms = guest_tsc(&fresh).wrapping_sub(saved_tsc) / khz;
+        for (what, ms) in [("kvmclock", clock_ms), ("TSC", tsc_ms)] {
+            assert!(
+                (gap_ms..gap_ms + 200).contains(&ms),
+                "guest {what} moved {ms} ms across a {gap_ms} ms gap"
+            );
+        }
+    }
+
+    #[cfg(checkpoint)]
+    #[test]
+    fn rebased_offset_keeps_the_guest_tsc_counting_through_the_gap() {
+        let khz: u32 = 3_600_000;
+        let elapsed_ns: u64 = 10_000_000_000;
+        let elapsed_ticks = elapsed_ns * u64::from(khz) / 1_000_000;
+        // Host TSC bases near zero, and across the u64 wrap.
+        for (offset, saved_host, now_host) in [
+            (0u64, 1_000u64, 1_000 + 2 * elapsed_ticks),
+            (u64::MAX - 5, u64::MAX - 1_000, 500),
+            (1 << 63, 7, 3),
+        ] {
+            let guest_at_save = saved_host.wrapping_add(offset);
+            let offset = rebased_tsc_offset(
+                offset,
+                khz,
+                5_000_000_000,
+                5_000_000_000 + elapsed_ns,
+                saved_host,
+                now_host,
+            );
+            assert_eq!(
+                now_host.wrapping_add(offset),
+                guest_at_save.wrapping_add(elapsed_ticks)
+            );
+        }
+        // One tick at 1 MHz is 1 µs: forward across the wrap, and backwards.
+        assert_eq!(advance_tsc(u64::MAX, 1_000, 1_000), 0);
+        assert_eq!(advance_tsc(10, -1_000, 1_000), 9);
+    }
+
+    #[cfg(checkpoint)]
+    #[test]
+    fn kvmclock_anchor_refuses_a_bad_wall_clock_sample() {
+        assert_eq!(midpoint(100, 300).unwrap(), 200);
+        assert!(midpoint(300, 100).is_err(), "wall clock stepped back");
+        assert!(midpoint(0, 1_000_000_000).is_err(), "a 1 s window");
     }
 }
