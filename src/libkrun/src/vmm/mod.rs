@@ -72,6 +72,8 @@ use crossbeam_channel::Sender;
 use devices::fdt;
 use devices::legacy::IrqChip;
 use devices::virtio::VmmExitObserver;
+#[cfg(checkpoint)]
+use devices::virtio::persist::VmDevicesState;
 use kernel::cmdline::Cmdline as KernelCmdline;
 use polly::event_manager::{EventManager, Subscriber};
 use utils::epoll::{EpollEvent, EventSet};
@@ -210,7 +212,25 @@ pub enum VmCtl {
 
 impl Vmm {
     /// Starts the microVM vcpus.
-    pub fn start_vcpus(&mut self, mut vcpus: Vec<Vcpu>) -> Result<()> {
+    pub fn start_vcpus(&mut self, vcpus: Vec<Vcpu>) -> Result<()> {
+        self.spawn_vcpus(vcpus)?;
+
+        // The vcpus start off in the `Paused` state, let them run.
+        self.resume_vcpus()?;
+
+        Ok(())
+    }
+
+    /// Starts the vCPU threads but leaves them parked, for a restore to load
+    /// their state; [`Vmm::resume`] runs them.
+    #[cfg(checkpoint)]
+    fn start_vcpus_paused(&mut self, vcpus: Vec<Vcpu>) -> Result<()> {
+        self.spawn_vcpus(vcpus)?;
+        self.paused = true;
+        Ok(())
+    }
+
+    fn spawn_vcpus(&mut self, mut vcpus: Vec<Vcpu>) -> Result<()> {
         let vcpu_count = vcpus.len();
 
         Vcpu::register_kick_signal_handler();
@@ -223,10 +243,6 @@ impl Vmm {
             self.vcpus_handles
                 .push(vcpu.start_threaded().map_err(Error::VcpuHandle)?);
         }
-
-        // The vcpus start off in the `Paused` state, let them run.
-        self.resume_vcpus()?;
-
         Ok(())
     }
 
@@ -526,7 +542,8 @@ impl Vmm {
     }
 }
 
-/// Checkpoints: saving a running VM to a directory.
+/// Checkpoints: saving a running VM to a directory, and restoring one into a
+/// new VMM.
 #[cfg(checkpoint)]
 impl Vmm {
     /// Saves the VM to `dir`, which must not exist yet (its parent must). On
@@ -575,6 +592,38 @@ impl Vmm {
         }
     }
 
+    /// Restores `checkpoint` into this VM instead of booting it. The VM was
+    /// built for it: the checkpoint's vCPU count, RAM layout (holding the
+    /// checkpoint's RAM) and devices; `vcpus` are created but not started.
+    /// The VM is left paused: [`Vmm::resume`] runs the guest on from where it
+    /// was saved.
+    pub(crate) fn restore(
+        &mut self,
+        checkpoint: Checkpoint,
+        vcpus: Vec<Vcpu>,
+    ) -> std::result::Result<(), String> {
+        let Checkpoint {
+            devices,
+            vm,
+            vcpus: mut vcpu_states,
+            device_state,
+            ..
+        } = checkpoint;
+        let device_state = VmDevicesState::from_bytes(&device_state)?;
+        self.vm.restore_state(&vm).map_err(|e| e.to_string())?;
+        self.vm
+            .rebase_vcpu_tsc(&vm, &mut vcpu_states)
+            .map_err(|e| e.to_string())?;
+        // Before the vCPU threads start, so that a VM with other devices is
+        // refused without leaving any behind.
+        self.mmio_device_manager
+            .restore_devices(&devices, &device_state)?;
+        self.start_vcpus_paused(vcpus).map_err(|e| e.to_string())?;
+        self.restore_vcpu_states(vcpu_states)?;
+        self.mmio_device_manager.replay_restored_interrupts();
+        Ok(())
+    }
+
     /// The state of every vCPU; they must be paused.
     fn save_vcpu_states(&self) -> std::result::Result<Vec<VcpuState>, String> {
         let events = self
@@ -592,6 +641,23 @@ impl Vmm {
                 Err(e) => Err(format!("vCPU {i}: {e}")),
             })
             .collect()
+    }
+
+    /// Loads each paused vCPU with its state, in vCPU order.
+    fn restore_vcpu_states(&self, states: Vec<VcpuState>) -> std::result::Result<(), String> {
+        let events = states
+            .into_iter()
+            .map(|state| VcpuEvent::RestoreState(Box::new(state)))
+            .collect();
+        for (i, answer) in self.ask_vcpus(events).into_iter().enumerate() {
+            match answer {
+                Ok(VcpuResponse::RestoredState) => {}
+                Ok(VcpuResponse::RestoreFailed(e)) => return Err(format!("vCPU {i}: {e}")),
+                Ok(other) => return Err(format!("vCPU {i}: unexpected response {other:?}")),
+                Err(e) => return Err(format!("vCPU {i}: {e}")),
+            }
+        }
+        Ok(())
     }
 
     /// Hands the first vCPUs one event each and collects every answer, even

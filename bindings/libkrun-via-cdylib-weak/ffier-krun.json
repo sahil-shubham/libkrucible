@@ -1512,6 +1512,33 @@
           "ffi_name": "krun_vmm_builder_shutdown_support"
         },
         {
+          "name": "restore_from",
+          "doc": [
+            " Restore the VM from a checkpoint directory instead of booting:",
+            " [`build`](Self::build) maps the checkpoint's `memory.bin` privately",
+            " (the directory is never modified, so it can be restored any number of",
+            " times), checks the checkpoint against this builder's vCPUs, RAM and",
+            " devices, and the VM resumes where [`VmmHandle::save`] froze it. The",
+            " payload and every device must be configured as for the saved VM (same",
+            " types, ids and order); their host-side resources (socket paths, disk",
+            " files) are new."
+          ],
+          "receiver": "value",
+          "params": [
+            {
+              "name": "dir",
+              "param_kind": "regular",
+              "type": "str",
+              "ref_kind": "shared"
+            }
+          ],
+          "ret": {
+            "return_kind": "value",
+            "type": "Self"
+          },
+          "ffi_name": "krun_vmm_builder_restore_from"
+        },
+        {
           "name": "build",
           "receiver": "value",
           "params": [],
@@ -2813,8 +2840,9 @@
       "name": "checkpoint_supported",
       "ffi_name": "krun_checkpoint_supported",
       "doc": [
-        " Whether this build, on this host, can save VMs ([`VmmHandle::save`]):",
-        " Linux KVM on x86_64 for now."
+        " Whether this build, on this host, can save and restore VMs",
+        " ([`VmmHandle::save`], [`VmmBuilder::restore_from`]): Linux KVM on x86_64",
+        " for now."
       ],
       "params": [],
       "ret": {

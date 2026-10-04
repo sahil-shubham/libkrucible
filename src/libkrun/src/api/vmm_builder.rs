@@ -1,7 +1,6 @@
 use std::marker::PhantomData;
 #[cfg(not(target_os = "windows"))]
 use std::os::fd::{AsRawFd, BorrowedFd};
-#[cfg(checkpoint)]
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -37,6 +36,7 @@ pub struct VmmBuilder<'a> {
     acpi: bool,
     smbios_oem_strings: Vec<String>,
     shutdown_support: bool,
+    restore_from: Option<PathBuf>,
 }
 
 #[cfg_attr(feature = "ffi", ffier::export)]
@@ -137,6 +137,19 @@ impl<'a> VmmBuilder<'a> {
     /// default. On other platforms, shutdown remains unsupported.
     pub fn shutdown_support(mut self, enabled: bool) -> Self {
         self.shutdown_support = enabled;
+        self
+    }
+
+    /// Restore the VM from a checkpoint directory instead of booting:
+    /// [`build`](Self::build) maps the checkpoint's `memory.bin` privately
+    /// (the directory is never modified, so it can be restored any number of
+    /// times), checks the checkpoint against this builder's vCPUs, RAM and
+    /// devices, and the VM resumes where [`VmmHandle::save`] froze it. The
+    /// payload and every device must be configured as for the saved VM (same
+    /// types, ids and order); their host-side resources (socket paths, disk
+    /// files) are new.
+    pub fn restore_from(mut self, dir: &str) -> Self {
+        self.restore_from = Some(PathBuf::from(dir));
         self
     }
 
@@ -368,8 +381,9 @@ pub fn check_nested_virt() -> bool {
     }
 }
 
-/// Whether this build, on this host, can save VMs ([`VmmHandle::save`]):
-/// Linux KVM on x86_64 for now.
+/// Whether this build, on this host, can save and restore VMs
+/// ([`VmmHandle::save`], [`VmmBuilder::restore_from`]): Linux KVM on x86_64
+/// for now.
 #[cfg_attr(feature = "ffi", ffier::export)]
 pub fn checkpoint_supported() -> bool {
     #[cfg(checkpoint)]
@@ -409,6 +423,21 @@ fn build_vm(builder_cfg: VmmBuilder<'_>) -> Result<Vmm<'_>, VmmError> {
     let device_manager = builder_cfg
         .device_manager
         .ok_or_else(|| VmmError::MissingConfig("no device manager set (call .devices())".into()))?;
+
+    #[cfg(checkpoint)]
+    let restore = builder_cfg
+        .restore_from
+        .as_deref()
+        .map(|dir| {
+            crate::vmm::checkpoint::format::Checkpoint::load(dir)
+                .map(|(checkpoint, memory)| crate::vmm::builder::RestoreCtx { checkpoint, memory })
+                .map_err(|e| VmmError::BootError(format!("restore: {e}")))
+        })
+        .transpose()?;
+    #[cfg(not(checkpoint))]
+    if builder_cfg.restore_from.is_some() {
+        return Err(VmmError::FeatureDisabled());
+    }
 
     let mut vm_resources = VmResources::default();
     vm_resources
@@ -512,8 +541,17 @@ fn build_vm(builder_cfg: VmmBuilder<'_>) -> Result<Vmm<'_>, VmmError> {
         None,
         sender.clone(),
         device_manager,
+        #[cfg(checkpoint)]
+        restore,
     )
-    .map_err(|e| VmmError::BootError(format!("{e:?}")))?;
+    .map_err(|e| match e {
+        // A refused restore explains itself; the rest are internal states.
+        #[cfg(checkpoint)]
+        crate::vmm::builder::StartMicrovmError::Checkpoint(e) => {
+            VmmError::BootError(format!("restore: {e}"))
+        }
+        e => VmmError::BootError(format!("{e:?}")),
+    })?;
 
     let needs_worker = {
         #[cfg(any(feature = "amd-sev", feature = "tdx"))]

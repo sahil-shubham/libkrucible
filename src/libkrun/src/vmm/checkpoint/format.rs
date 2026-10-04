@@ -240,6 +240,35 @@ impl Checkpoint {
         }
         Ok((checkpoint, memory))
     }
+
+    /// Refuses a VM with another vCPU count than the saved one.
+    pub(crate) fn check_vcpus(&self, count: usize) -> Result<(), String> {
+        match self.vcpus.len() {
+            saved if saved == count => Ok(()),
+            saved => Err(format!(
+                "vCPU count differs: the checkpoint has {saved}, this VM has {count}"
+            )),
+        }
+    }
+
+    /// Refuses a VM whose guest RAM isn't laid out as the saved one's.
+    pub(crate) fn check_ram(&self, layout: &[RamRegion]) -> Result<(), String> {
+        if layout == self.ram {
+            return Ok(());
+        }
+        let list = |regions: &[RamRegion]| {
+            regions
+                .iter()
+                .map(|r| format!("{:#x}+{:#x}", r.gpa, r.len))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        Err(format!(
+            "RAM layout differs: the checkpoint has [{}], this VM has [{}]",
+            list(&self.ram),
+            list(layout)
+        ))
+    }
 }
 
 /// Decodes a length-prefixed section that must be consumed exactly.

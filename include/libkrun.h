@@ -423,6 +423,18 @@ typedef void (*krun_vmm_builder_add_smbios_oem_string_fn)(KrunVmmBuilder* handle
  */
 void krun_vmm_builder_shutdown_support(KrunVmmBuilder* handle, bool enabled);
 typedef void (*krun_vmm_builder_shutdown_support_fn)(KrunVmmBuilder* handle, bool enabled);
+/**
+ * Restore the VM from a checkpoint directory instead of booting:
+ * [`build`](Self::build) maps the checkpoint's `memory.bin` privately
+ * (the directory is never modified, so it can be restored any number of
+ * times), checks the checkpoint against this builder's vCPUs, RAM and
+ * devices, and the VM resumes where [`VmmHandle::save`] froze it. The
+ * payload and every device must be configured as for the saved VM (same
+ * types, ids and order); their host-side resources (socket paths, disk
+ * files) are new.
+ */
+void krun_vmm_builder_restore_from(KrunVmmBuilder* handle, KrunStr dir);
+typedef void (*krun_vmm_builder_restore_from_fn)(KrunVmmBuilder* handle, KrunStr dir);
 KrunVmm krun_vmm_builder_build(KrunVmmBuilder* handle, KrunError* err_out);
 typedef KrunVmm (*krun_vmm_builder_build_fn)(KrunVmmBuilder* handle, KrunError* err_out);
 void krun_vmm_builder_destroy(KrunVmmBuilder handle);
@@ -703,8 +715,9 @@ typedef KrunResult (*krun_init_log_fn)(int target, uint32_t level, uint32_t styl
 bool krun_check_nested_virt(void);
 typedef bool (*krun_check_nested_virt_fn)(void);
 /**
- * Whether this build, on this host, can save VMs ([`VmmHandle::save`]):
- * Linux KVM on x86_64 for now.
+ * Whether this build, on this host, can save and restore VMs
+ * ([`VmmHandle::save`], [`VmmBuilder::restore_from`]): Linux KVM on x86_64
+ * for now.
  */
 bool krun_checkpoint_supported(void);
 typedef bool (*krun_checkpoint_supported_fn)(void);

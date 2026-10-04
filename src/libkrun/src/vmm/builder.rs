@@ -190,6 +190,9 @@ pub enum StartMicrovmError {
     RawOpenKernel(io::Error),
     /// Cannot attach a device via the device manager.
     AttachDevice(String),
+    /// The checkpoint can't be restored into this VM.
+    #[cfg(checkpoint)]
+    Checkpoint(String),
     /// Cannot initialize a MMIO Balloon device or add a device to the MMIO Bus.
     RegisterBalloonDevice(device_manager::mmio::Error),
     /// Cannot initialize a MMIO Block Device or add a device to the MMIO Bus.
@@ -393,6 +396,8 @@ impl Display for StartMicrovmError {
                 write!(f, "Cannot open the file containing the kernel code: {err}")
             }
             AttachDevice(ref err) => write!(f, "Cannot attach device: {err}"),
+            #[cfg(checkpoint)]
+            Checkpoint(ref err) => write!(f, "{err}"),
             RegisterBalloonDevice(ref err) => {
                 let mut err_msg = format!("{err}");
                 err_msg = err_msg.replace('\"', "");
@@ -703,6 +708,14 @@ fn measure_qboot_regions(
     Ok((regions, 0u64))
 }
 
+/// A checkpoint to restore instead of booting the payload.
+#[cfg(checkpoint)]
+pub struct RestoreCtx {
+    pub(crate) checkpoint: crate::vmm::checkpoint::format::Checkpoint,
+    /// Its `memory.bin`, open read-only.
+    pub(crate) memory: File,
+}
+
 /// Builds and starts a microVM based on the current Firecracker VmResources configuration.
 pub fn build_microvm(
     vm_resources: &super::resources::VmResources,
@@ -710,8 +723,20 @@ pub fn build_microvm(
     _shutdown_efd: Option<EventFd>,
     _sender: Sender<WorkerMessage>,
     device_manager: Box<dyn crate::api::device_builders::DeviceManager<'_> + '_>,
+    #[cfg(checkpoint)] restore: Option<RestoreCtx>,
 ) -> std::result::Result<Arc<Mutex<Vmm>>, StartMicrovmError> {
     let payload = choose_payload(vm_resources)?;
+    #[cfg(checkpoint)]
+    let restoring = restore.is_some();
+    #[cfg(not(checkpoint))]
+    let restoring = false;
+    #[cfg(checkpoint)]
+    if let Some(restore) = &restore {
+        restore
+            .checkpoint
+            .check_vcpus(usize::from(vm_resources.vcpu_config().vcpu_count))
+            .map_err(StartMicrovmError::Checkpoint)?;
+    }
 
     let requirements = device_manager.requirements();
     let fs_shm_sizes: Vec<Option<usize>> = requirements.iter().map(|r| r.shm_size).collect();
@@ -758,6 +783,8 @@ pub fn build_microvm(
         &payload,
         #[cfg(feature = "tee")]
         fw_range_for_mem,
+        #[cfg(checkpoint)]
+        restore.as_ref(),
     )?;
 
     let vcpu_config = vm_resources.vcpu_config();
@@ -1070,7 +1097,10 @@ pub fn build_microvm(
             Some(intc.clone()),
         )?;
 
-        let kernel_boot = vm_resources.firmware_config.is_none() && !cfg!(feature = "tee");
+        // A restored guest is past boot: its vCPUs load their saved state, and
+        // the boot-time structures would overwrite its RAM.
+        let kernel_boot =
+            vm_resources.firmware_config.is_none() && !cfg!(feature = "tee") && !restoring;
 
         vcpus = create_vcpus_x86_64(
             &vm,
@@ -1300,42 +1330,45 @@ pub fn build_microvm(
         }
     }
 
-    // Write the kernel command line to guest memory. This is x86_64 specific, since on
-    // aarch64 the command line will be specified through the FDT.
-    // For the TD-Shim path, the cmdline is written so TD-Shim can reference it when
-    // populating boot_params for the Linux kernel (cmd_line_ptr already points here
-    // via configure_system).
-    #[cfg(all(target_arch = "x86_64", not(feature = "tee")))]
-    load_cmdline(&vmm)?;
-    #[cfg(all(target_arch = "x86_64", feature = "tdx"))]
-    if vm_resources.tee_firmware_config.is_some() {
+    // A restored guest's RAM already holds what boot would write there.
+    if !restoring {
+        // Write the kernel command line to guest memory. This is x86_64 specific, since on
+        // aarch64 the command line will be specified through the FDT.
+        // For the TD-Shim path, the cmdline is written so TD-Shim can reference it when
+        // populating boot_params for the Linux kernel (cmd_line_ptr already points here
+        // via configure_system).
+        #[cfg(all(target_arch = "x86_64", not(feature = "tee")))]
         load_cmdline(&vmm)?;
-    }
+        #[cfg(all(target_arch = "x86_64", feature = "tdx"))]
+        if vm_resources.tee_firmware_config.is_some() {
+            load_cmdline(&vmm)?;
+        }
 
-    #[cfg(all(
-        target_arch = "x86_64",
-        any(target_os = "linux", target_os = "windows")
-    ))]
-    let virtio_mmio_devices = if vm_resources.acpi_enabled {
-        vmm.mmio_device_manager.virtio_mmio_devices()
-    } else {
-        Vec::new()
-    };
-    #[cfg(not(all(
-        target_arch = "x86_64",
-        any(target_os = "linux", target_os = "windows")
-    )))]
-    let virtio_mmio_devices: Vec<(u64, u32)> = vec![];
-    vmm.configure_system(
-        vcpus.as_slice(),
-        &intc,
-        &payload_config.initrd_config,
-        &vm_resources.smbios_oem_strings,
-        vm_resources.acpi_enabled,
-        &virtio_mmio_devices,
-        payload_config.pvh,
-    )
-    .map_err(StartMicrovmError::Internal)?;
+        #[cfg(all(
+            target_arch = "x86_64",
+            any(target_os = "linux", target_os = "windows")
+        ))]
+        let virtio_mmio_devices = if vm_resources.acpi_enabled {
+            vmm.mmio_device_manager.virtio_mmio_devices()
+        } else {
+            Vec::new()
+        };
+        #[cfg(not(all(
+            target_arch = "x86_64",
+            any(target_os = "linux", target_os = "windows")
+        )))]
+        let virtio_mmio_devices: Vec<(u64, u32)> = vec![];
+        vmm.configure_system(
+            vcpus.as_slice(),
+            &intc,
+            &payload_config.initrd_config,
+            &vm_resources.smbios_oem_strings,
+            vm_resources.acpi_enabled,
+            &virtio_mmio_devices,
+            payload_config.pvh,
+        )
+        .map_err(StartMicrovmError::Internal)?;
+    }
 
     #[cfg(feature = "tee")]
     {
@@ -1371,6 +1404,28 @@ pub fn build_microvm(
         println!("Starting TEE/microVM.");
     }
 
+    #[cfg(checkpoint)]
+    if let Some(RestoreCtx { checkpoint, .. }) = restore {
+        vmm.restore(checkpoint, vcpus)
+            .map_err(StartMicrovmError::Checkpoint)?;
+        // Re-activating the devices queued the events that hook their queues
+        // up to this event loop: serve them before the guest runs and kicks a
+        // queue. They don't cascade, so a few rounds drain them.
+        for _ in 0..8 {
+            let served = event_manager.run_with_timeout(0).map_err(|e| {
+                StartMicrovmError::Checkpoint(format!("serve the restored devices: {e:?}"))
+            })?;
+            if served == 0 {
+                break;
+            }
+        }
+        vmm.resume()
+            .map_err(|e| StartMicrovmError::Checkpoint(format!("resume the restored VM: {e}")))?;
+    } else {
+        vmm.start_vcpus(vcpus)
+            .map_err(StartMicrovmError::Internal)?;
+    }
+    #[cfg(not(checkpoint))]
     vmm.start_vcpus(vcpus)
         .map_err(StartMicrovmError::Internal)?;
 
@@ -1815,6 +1870,7 @@ pub fn create_guest_memory(
     use_vhost_user: bool,
     payload: &Payload,
     #[cfg(feature = "tee")] firmware_range: Option<(u64, usize)>,
+    #[cfg(checkpoint)] restore: Option<&RestoreCtx>,
 ) -> std::result::Result<
     (GuestMemoryMmap, ArchMemoryInfo, ShmManager, PayloadConfig),
     StartMicrovmError,
@@ -1906,6 +1962,39 @@ pub fn create_guest_memory(
 
     // Add SHM regions before creating guest memory
     arch_mem_regions.extend(shm_manager.regions());
+
+    // A restore maps the checkpoint's RAM, a guest past boot: there's no
+    // payload to load.
+    #[cfg(checkpoint)]
+    if let Some(restore) = restore {
+        use crate::vmm::checkpoint::memory::{self, RamRegion};
+        if use_vhost_user {
+            return Err(StartMicrovmError::Checkpoint(
+                "devices differ: a vhost-user device can't be restored".into(),
+            ));
+        }
+        let layout: Vec<RamRegion> = arch_mem_regions
+            .iter()
+            .map(|(gpa, len)| RamRegion {
+                gpa: gpa.raw_value(),
+                len: *len as u64,
+            })
+            .collect();
+        restore
+            .checkpoint
+            .check_ram(&layout)
+            .map_err(StartMicrovmError::Checkpoint)?;
+        let guest_mem = memory::map_private(&restore.memory, &layout)
+            .map_err(|e| StartMicrovmError::Checkpoint(format!("map the checkpoint's RAM: {e}")))?;
+        arch_mem_info.guest_last_addr = guest_mem.last_addr().raw_value();
+        let payload_config = PayloadConfig {
+            entry_addr: GuestAddress(0),
+            initrd_config: None,
+            kernel_cmdline: None,
+            pvh: false,
+        };
+        return Ok((guest_mem, arch_mem_info, shm_manager, payload_config));
+    }
 
     let guest_mem = if use_vhost_user {
         #[cfg(all(feature = "vhost-user", target_os = "linux"))]
@@ -2515,6 +2604,8 @@ pub mod tests {
             false,
             &Payload::Empty,
             #[cfg(feature = "tee")]
+            None,
+            #[cfg(checkpoint)]
             None,
         )
     }
