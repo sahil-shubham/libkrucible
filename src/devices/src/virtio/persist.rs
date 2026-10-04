@@ -43,6 +43,19 @@ impl DeviceSnapshot {
         }
     }
 
+    /// Whether the guest had set the device up. One it hadn't is left for the
+    /// restored guest to set up, like a device on a fresh boot.
+    pub fn activated(&self) -> bool {
+        match self {
+            Self::Console(s) => s.activated,
+            Self::Vsock(s) => s.activated,
+            #[cfg(feature = "blk")]
+            Self::Block(s) => s.activated,
+            #[cfg(feature = "net")]
+            Self::Net(s) => s.activated,
+        }
+    }
+
     /// Queue index order matches the guest's MMIO queue selector.
     pub fn queue_states(&self) -> Vec<Option<QueueState>> {
         match self {

@@ -9,11 +9,17 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::{fmt, io};
 
+#[cfg(checkpoint)]
+use crate::vmm::checkpoint::format::DeviceId;
 use devices::DeviceType;
 #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 use devices::fdt::DeviceInfoForFDT;
 #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 use devices::legacy::IrqChip;
+#[cfg(checkpoint)]
+use devices::virtio::persist::{VmDevicesState, restore_device, snapshot_device};
+#[cfg(checkpoint)]
+use devices::virtio::{MmioTransport, VirtioDevice};
 use kernel::cmdline as kernel_cmdline;
 use kvm_ioctls::{IoEventAddress, VmFd};
 #[cfg(target_arch = "aarch64")]
@@ -84,6 +90,21 @@ pub struct MMIODeviceManager {
     irq: u32,
     last_irq: u32,
     id_to_dev_info: HashMap<(DeviceType, String), MMIODeviceInfo>,
+    /// The virtio devices in registration order, which is how a checkpoint
+    /// lists them and how a restore matches them up.
+    #[cfg(checkpoint)]
+    virtio_devices: Vec<VirtioEntry>,
+    /// A userspace IOAPIC (split IRQ chip) is on the bus: its state isn't in
+    /// KVM, where a checkpoint reads the interrupt controllers from.
+    #[cfg(checkpoint)]
+    userspace_ioapic: bool,
+}
+
+#[cfg(checkpoint)]
+struct VirtioEntry {
+    id: DeviceId,
+    transport: Arc<Mutex<MmioTransport>>,
+    device: Arc<Mutex<dyn VirtioDevice>>,
 }
 
 impl MMIODeviceManager {
@@ -98,6 +119,10 @@ impl MMIODeviceManager {
             last_irq: irq_interval.1,
             bus: devices::Bus::new(),
             id_to_dev_info: HashMap::new(),
+            #[cfg(checkpoint)]
+            virtio_devices: Vec::new(),
+            #[cfg(checkpoint)]
+            userspace_ioapic: false,
         }
     }
 
@@ -113,6 +138,10 @@ impl MMIODeviceManager {
                 (intc.get_mmio_addr(), intc.get_mmio_size())
             };
             self.bus.insert(intc, addr, size).map_err(Error::BusError)?;
+            #[cfg(checkpoint)]
+            {
+                self.userspace_ioapic = true;
+            }
         }
 
         Ok(())
@@ -144,9 +173,23 @@ impl MMIODeviceManager {
 
         mmio_device.set_irq_line(self.irq);
 
+        #[cfg(checkpoint)]
+        let device = mmio_device.device();
+        let transport = Arc::new(Mutex::new(mmio_device));
+        #[cfg(checkpoint)]
+        let kept = transport.clone();
         self.bus
-            .insert(Arc::new(Mutex::new(mmio_device)), self.mmio_base, MMIO_LEN)
+            .insert(transport, self.mmio_base, MMIO_LEN)
             .map_err(Error::BusError)?;
+        #[cfg(checkpoint)]
+        self.virtio_devices.push(VirtioEntry {
+            id: DeviceId {
+                type_id,
+                id: device_id.clone(),
+            },
+            transport: kept,
+            device,
+        });
         let ret = (self.mmio_base, self.irq);
         self.id_to_dev_info.insert(
             (DeviceType::Virtio(type_id), device_id),
@@ -290,6 +333,133 @@ impl MMIODeviceManager {
             .collect();
         devices.sort_unstable_by_key(|(base, _)| *base);
         devices
+    }
+}
+
+/// Checkpoints: capturing the virtio devices' state, and bringing a VM rebuilt
+/// from a checkpoint back to it.
+#[cfg(checkpoint)]
+impl MMIODeviceManager {
+    /// The virtio devices, in registration order.
+    pub(crate) fn device_ids(&self) -> Vec<DeviceId> {
+        self.virtio_devices.iter().map(|d| d.id.clone()).collect()
+    }
+
+    /// Why this VM's devices can't be checkpointed, if they can't.
+    pub(crate) fn checkpoint_refusal(&self) -> Option<String> {
+        if self.userspace_ioapic {
+            return Some("its IOAPIC is emulated in userspace (split IRQ chip)".into());
+        }
+        self.virtio_devices.iter().find_map(|d| {
+            let device = d.device.lock().expect("poisoned virtio device lock");
+            snapshot_device(&*device)
+                .is_none()
+                .then(|| format!("{} device {} can't be saved", device.device_name(), d.id.id))
+        })
+    }
+
+    /// Stops every device's I/O at a clean boundary (the vCPUs must be
+    /// paused), failing if a device couldn't get there. Undone by
+    /// [`Self::rearm_devices`].
+    pub(crate) fn quiesce_devices(&self) -> std::result::Result<(), String> {
+        for d in &self.virtio_devices {
+            d.device
+                .lock()
+                .expect("poisoned virtio device lock")
+                .quiesce_for_snapshot();
+        }
+        for d in &self.virtio_devices {
+            let device = d.device.lock().expect("poisoned virtio device lock");
+            if let Some(e) = device.snapshot_error() {
+                return Err(format!("{}: {e}", d.id));
+            }
+        }
+        Ok(())
+    }
+
+    /// Restarts the I/O [`Self::quiesce_devices`] stopped.
+    pub(crate) fn rearm_devices(&self) {
+        for d in &self.virtio_devices {
+            d.device
+                .lock()
+                .expect("poisoned virtio device lock")
+                .rearm_after_snapshot();
+        }
+    }
+
+    /// Every device's state and pending interrupts; the devices must be
+    /// quiesced.
+    pub(crate) fn snapshot_devices(&self) -> std::result::Result<VmDevicesState, String> {
+        let mut state = VmDevicesState::default();
+        for d in &self.virtio_devices {
+            let interrupt_status = d
+                .transport
+                .lock()
+                .expect("poisoned transport lock")
+                .interrupt_status();
+            let device = d.device.lock().expect("poisoned virtio device lock");
+            let snapshot =
+                snapshot_device(&*device).ok_or_else(|| format!("{}: can't be saved", d.id))?;
+            state.devices.push(snapshot);
+            state.interrupt_status.push(interrupt_status);
+        }
+        Ok(state)
+    }
+
+    /// Brings the devices of a VM rebuilt from a checkpoint to their saved
+    /// `state`. The VM must have registered the devices the saved VM had
+    /// (`saved`: types and ids, in order); otherwise nothing is touched. A
+    /// device the guest had set up is re-activated from its saved queues,
+    /// without the virtio handshake a restored guest never repeats.
+    pub(crate) fn restore_devices(
+        &self,
+        saved: &[DeviceId],
+        state: &VmDevicesState,
+    ) -> std::result::Result<(), String> {
+        if !self.virtio_devices.iter().map(|d| &d.id).eq(saved) {
+            let list = |ids: &mut dyn Iterator<Item = &DeviceId>| {
+                ids.map(DeviceId::to_string).collect::<Vec<_>>().join(", ")
+            };
+            return Err(format!(
+                "devices differ: the checkpoint has [{}], this VM has [{}]",
+                list(&mut saved.iter()),
+                list(&mut self.virtio_devices.iter().map(|d| &d.id))
+            ));
+        }
+        if state.devices.len() != saved.len() || state.interrupt_status.len() != saved.len() {
+            return Err(format!(
+                "corrupt device state: {} devices, {} device states, {} interrupt states",
+                saved.len(),
+                state.devices.len(),
+                state.interrupt_status.len()
+            ));
+        }
+        let entries = self.virtio_devices.iter().zip(&state.devices);
+        for ((d, snapshot), status) in entries.zip(&state.interrupt_status) {
+            let fail = |e: String| format!("{}: {e}", d.id);
+            let mut transport = d.transport.lock().expect("poisoned transport lock");
+            restore_device(&mut *transport.locked_device(), snapshot).map_err(fail)?;
+            if snapshot.activated() {
+                transport
+                    .restore_and_activate(&snapshot.queue_states(), snapshot.acked_features())
+                    .map_err(fail)?;
+                transport.set_restored_interrupt_status(*status);
+                transport.locked_device().finish_restore_activation();
+            }
+        }
+        Ok(())
+    }
+
+    /// Raises the interrupts the restored devices had pending. Only once the
+    /// vCPUs' state is restored: loading a vCPU's LAPIC drops what was
+    /// delivered to it before.
+    pub(crate) fn replay_restored_interrupts(&self) {
+        for d in &self.virtio_devices {
+            d.transport
+                .lock()
+                .expect("poisoned transport lock")
+                .replay_restored_interrupt();
+        }
     }
 }
 
@@ -620,5 +790,129 @@ mod tests {
         };
         assert_eq!(devices[0], (first, arch::IRQ_BASE));
         assert_eq!(devices[1], (first + MMIO_LEN, arch::IRQ_BASE + 1));
+    }
+
+    #[cfg(checkpoint)]
+    mod checkpoint {
+        use super::*;
+        use devices::virtio::block::{DiskFormat, SyncMode};
+        use devices::virtio::persist::DeviceSnapshot;
+        use devices::virtio::{Block, CacheType, QueueState, TYPE_BLOCK};
+        use utils::tempfile::TempFile;
+
+        /// A VM with a block device per id, each over its own small disk.
+        struct Rig {
+            manager: MMIODeviceManager,
+            blocks: Vec<Arc<Mutex<Block>>>,
+            _disks: Vec<TempFile>,
+            _ioapic: KvmIoapic,
+            _vm: crate::vmm::vstate::Vm,
+        }
+
+        fn rig(ids: &[&str]) -> Rig {
+            let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+            let vm = builder::setup_vm(&mem, &mut arch::ArchMemoryInfo::default(), false).unwrap();
+            let ioapic = KvmIoapic::new(vm.fd()).unwrap();
+            let mut manager =
+                MMIODeviceManager::new(&mut 0xd000_0000, (arch::IRQ_BASE, arch::IRQ_MAX));
+            let mut cmdline = kernel_cmdline::Cmdline::new(4096);
+            let (mut blocks, mut disks) = (Vec::new(), Vec::new());
+            for id in ids {
+                let disk = TempFile::new().unwrap();
+                disk.as_file().set_len(4096).unwrap();
+                let block = Arc::new(Mutex::new(
+                    Block::new(
+                        id.to_string(),
+                        None,
+                        CacheType::Unsafe,
+                        disk.as_path().to_str().unwrap().into(),
+                        DiskFormat::Raw,
+                        false,
+                        false,
+                        SyncMode::Full,
+                    )
+                    .unwrap(),
+                ));
+                manager
+                    .register_virtio_device(
+                        vm.fd(),
+                        mem.clone(),
+                        block.clone(),
+                        &mut cmdline,
+                        TYPE_BLOCK,
+                        id,
+                    )
+                    .unwrap();
+                blocks.push(block);
+                disks.push(disk);
+            }
+            Rig {
+                manager,
+                blocks,
+                _disks: disks,
+                _ioapic: ioapic,
+                _vm: vm,
+            }
+        }
+
+        /// What a checkpoint holds for `block` once the guest had set it up.
+        fn set_up(block: &Arc<Mutex<Block>>) -> DeviceSnapshot {
+            let mut state = block.lock().unwrap().save_state();
+            state.activated = true;
+            state.queue = Some(QueueState {
+                size: 16,
+                ready: true,
+                desc_table: 0x1000,
+                avail_ring: 0x2000,
+                used_ring: 0x3000,
+                next_avail: 5,
+                next_used: 5,
+                ..QueueState::default()
+            });
+            DeviceSnapshot::Block(state)
+        }
+
+        fn block(id: &str) -> DeviceId {
+            DeviceId {
+                type_id: TYPE_BLOCK,
+                id: id.into(),
+            }
+        }
+
+        #[test]
+        fn restore_into_other_devices_touches_none() {
+            let rig = rig(&["root", "vol1"]);
+            // Each state would apply cleanly to the device in its position;
+            // only the ids say the checkpoint came from another device set.
+            let state = VmDevicesState {
+                devices: rig.blocks.iter().map(set_up).collect(),
+                interrupt_status: vec![0, 0],
+            };
+            let err = rig
+                .manager
+                .restore_devices(&[block("root"), block("vol0")], &state)
+                .unwrap_err();
+            assert!(err.contains("devices differ"), "{err}");
+            for b in &rig.blocks {
+                assert!(!b.lock().unwrap().is_activated(), "a device was restored");
+            }
+        }
+
+        #[test]
+        fn restore_leaves_a_device_the_guest_never_set_up_for_it() {
+            let rig = rig(&["root", "spare"]);
+            let spare = DeviceSnapshot::Block(rig.blocks[1].lock().unwrap().save_state());
+            let state = VmDevicesState {
+                devices: vec![set_up(&rig.blocks[0]), spare],
+                interrupt_status: vec![0, 0],
+            };
+            rig.manager
+                .restore_devices(&rig.manager.device_ids(), &state)
+                .unwrap();
+            assert!(rig.blocks[0].lock().unwrap().is_activated());
+            // The restored guest may still set it up, through the handshake
+            // an activated device would refuse.
+            assert!(!rig.blocks[1].lock().unwrap().is_activated());
+        }
     }
 }
