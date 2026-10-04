@@ -2275,6 +2275,41 @@ enum VcpuEmulation {
     Stopped,
 }
 
+/// Real VM and vCPU state from a throwaway KVM VM, for tests of the layers
+/// that store it.
+#[cfg(all(test, checkpoint))]
+pub(crate) fn sample_states(vcpus: u8) -> (VmState, Vec<VcpuState>) {
+    let kvm = KvmContext::new().unwrap();
+    let mut vm = Vm::new(kvm.fd()).unwrap();
+    let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+    let _ioapic = devices::legacy::KvmIoapic::new(vm.fd()).unwrap();
+    vm.memory_init(&mem, kvm.max_memslots()).unwrap();
+    let config = VcpuConfig {
+        vcpu_count: vcpus,
+        ht_enabled: false,
+        cpu_template: None,
+        nested_enabled: false,
+    };
+    let states = (0..vcpus)
+        .map(|id| {
+            let exit_evt = EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap();
+            let mut vcpu = Vcpu::new_x86_64(
+                id,
+                vm.fd(),
+                vm.supported_cpuid().clone(),
+                vm.supported_msrs().clone(),
+                devices::Bus::new(),
+                exit_evt,
+            )
+            .unwrap();
+            vcpu.configure_x86_64(&mem, GuestAddress(0x1000), &config, true, false)
+                .unwrap();
+            vcpu.save_state().unwrap()
+        })
+        .collect();
+    (vm.save_state().unwrap(), states)
+}
+
 #[cfg(test)]
 mod tests {
     use crossbeam_channel::unbounded;

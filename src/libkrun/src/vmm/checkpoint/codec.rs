@@ -34,6 +34,11 @@ impl Encoder {
         self.0.extend_from_slice(&v.to_le_bytes());
     }
 
+    /// Bytes as they are, no length prefix.
+    pub(crate) fn raw(&mut self, b: &[u8]) {
+        self.0.extend_from_slice(b);
+    }
+
     pub(crate) fn u64(&mut self, v: u64) {
         self.0.extend_from_slice(&v.to_le_bytes());
     }
@@ -76,7 +81,8 @@ impl<'a> Decoder<'a> {
         Self { buf, pos: 0 }
     }
 
-    fn take(&mut self, n: usize) -> Result<&'a [u8], String> {
+    /// The next `n` bytes, no length prefix.
+    pub(crate) fn raw(&mut self, n: usize) -> Result<&'a [u8], String> {
         let end = self
             .pos
             .checked_add(n)
@@ -94,20 +100,20 @@ impl<'a> Decoder<'a> {
     }
 
     pub(crate) fn u32(&mut self) -> Result<u32, String> {
-        Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
+        Ok(u32::from_le_bytes(self.raw(4)?.try_into().unwrap()))
     }
 
     pub(crate) fn u64(&mut self) -> Result<u64, String> {
-        Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
+        Ok(u64::from_le_bytes(self.raw(8)?.try_into().unwrap()))
     }
 
     pub(crate) fn bytes(&mut self) -> Result<&'a [u8], String> {
         let len = self.u32()? as usize;
-        self.take(len)
+        self.raw(len)
     }
 
     pub(crate) fn pod<T: Pod>(&mut self) -> Result<T, String> {
-        let bytes = self.take(std::mem::size_of::<T>())?;
+        let bytes = self.raw(std::mem::size_of::<T>())?;
         // SAFETY: the slice holds exactly size_of::<T>() bytes, every bit
         // pattern is a valid `T: Pod`, and read_unaligned tolerates any
         // alignment.

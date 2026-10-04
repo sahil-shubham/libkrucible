@@ -3,3 +3,5 @@
 //! Built only where `cfg(checkpoint)` is set (see build.rs).
 
 pub(crate) mod codec;
+pub(crate) mod format;
+pub(crate) mod memory;
