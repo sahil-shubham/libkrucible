@@ -43,6 +43,9 @@ const MSR_KVM_PV_EOI_EN: u32 = 0x4b56_4d04;
 /// Taken from arch/x86/include/asm/msr-index.h
 const MSR_IA32_SPEC_CTRL: u32 = 0x0000_0048;
 const MSR_IA32_PRED_CMD: u32 = 0x0000_0049;
+/// IA32_U_CET: the first of the nine CET MSRs (0x6a0..=0x6a8).
+const MSR_IA32_U_CET: u32 = 0x0000_06a0;
+const MSR_IA32_XSS: u32 = 0x0000_0da0;
 
 // Creates a MsrRange of one msr given as argument.
 macro_rules! SINGLE_MSR {
@@ -139,9 +142,19 @@ static WHITELISTED_MSR_RANGES: &[MsrRange] = &[
     SINGLE_MSR!(MSR_CONFIG_TDP_LEVEL_2),
     SINGLE_MSR!(MSR_CONFIG_TDP_CONTROL),
     SINGLE_MSR!(MSR_TURBO_ACTIVATION_RATIO),
+    // The register half of CET state (U_CET, S_CET, PL0..PL3_SSP,
+    // ISST_ADDR), which KVM_GET_XSAVE doesn't carry. KVM lists them only on
+    // CET-capable hosts.
+    MSR_RANGE!(MSR_IA32_U_CET, 9),
     SINGLE_MSR!(MSR_IA32_TSCDEADLINE),
     MSR_RANGE!(APIC_BASE_MSR, APIC_MSR_INDEXES),
     SINGLE_MSR!(MSR_IA32_BNDCFGS),
+    // IA32_XSS enables supervisor XSAVE components (e.g. CET user state). A
+    // guest that enabled any keeps every task's FPU context in the compacted
+    // XSAVES format with those bits set; restoring it into a vCPU whose XSS is
+    // still 0 makes its first XRSTORS fault, and the kernel's fixup faults
+    // again until the task stack overflows.
+    SINGLE_MSR!(MSR_IA32_XSS),
     SINGLE_MSR!(MSR_KVM_WALL_CLOCK_NEW),
     SINGLE_MSR!(MSR_KVM_SYSTEM_TIME_NEW),
     SINGLE_MSR!(MSR_KVM_ASYNC_PF_EN),

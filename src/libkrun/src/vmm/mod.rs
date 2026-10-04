@@ -12,6 +12,9 @@
 
 /// Handles setup and initialization a `Vmm` object.
 pub mod builder;
+/// VM checkpoint state and its on-disk format.
+#[cfg(checkpoint)]
+pub(crate) mod checkpoint;
 pub(crate) mod device_manager;
 /// Resource store for configured microVM resources.
 pub mod resources;

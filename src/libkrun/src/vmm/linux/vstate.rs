@@ -41,17 +41,20 @@ use kbs_types::Tee;
 
 #[cfg(feature = "tee")]
 use crate::vmm::resources::TeeConfig;
+#[cfg(checkpoint)]
+use crate::vmm::checkpoint::codec::{Decoder, Encoder, Pod};
 use crate::vmm::vmm_config::machine_config::CpuFeaturesTemplate;
 #[cfg(target_arch = "x86_64")]
 use cpuid::{VmSpec, c3, filter_cpuid, t2};
 #[cfg(not(feature = "tee"))]
 use kvm_bindings::kvm_userspace_memory_region;
 #[cfg(target_arch = "x86_64")]
+use kvm_bindings::{CpuId, KVM_MAX_CPUID_ENTRIES, MsrList};
+#[cfg(checkpoint)]
 use kvm_bindings::{
-    CpuId, KVM_CLOCK_TSC_STABLE, KVM_IRQCHIP_IOAPIC, KVM_IRQCHIP_PIC_MASTER, KVM_IRQCHIP_PIC_SLAVE,
-    KVM_MAX_CPUID_ENTRIES, MsrList, Msrs, kvm_clock_data, kvm_debugregs, kvm_irqchip,
-    kvm_lapic_state, kvm_mp_state, kvm_pit_state2, kvm_regs, kvm_sregs, kvm_vcpu_events, kvm_xcrs,
-    kvm_xsave,
+    KVM_CLOCK_TSC_STABLE, KVM_IRQCHIP_IOAPIC, KVM_IRQCHIP_PIC_MASTER, KVM_IRQCHIP_PIC_SLAVE, Msrs,
+    kvm_clock_data, kvm_cpuid_entry2, kvm_debugregs, kvm_irqchip, kvm_lapic_state, kvm_mp_state,
+    kvm_msr_entry, kvm_pit_state2, kvm_regs, kvm_sregs, kvm_vcpu_events, kvm_xcrs, kvm_xsave,
 };
 use kvm_bindings::{KVM_API_VERSION, KVM_SYSTEM_EVENT_RESET, KVM_SYSTEM_EVENT_SHUTDOWN};
 #[cfg(feature = "tee")]
@@ -211,6 +214,14 @@ pub enum Error {
     #[cfg(target_arch = "x86_64")]
     /// Failed to set KVM vcpu xsave.
     VcpuSetXsave(kvm_ioctls::Error),
+    #[cfg(checkpoint)]
+    /// KVM read or wrote only some of a vCPU's MSRs; `first_failed` is the
+    /// index of the MSR it stopped at.
+    VcpuMsrsIncomplete {
+        expected: usize,
+        actual: usize,
+        first_failed: u32,
+    },
     /// Cannot spawn a new vCPU thread.
     VcpuSpawn(io::Error),
     /// Cannot cleanly initialize vcpu TLS.
@@ -369,6 +380,15 @@ impl Display for Error {
             VcpuSetXcrs(e) => write!(f, "Failed to set KVM vcpu xcrs: {e}"),
             #[cfg(target_arch = "x86_64")]
             VcpuSetXsave(e) => write!(f, "Failed to set KVM vcpu xsave: {e}"),
+            #[cfg(checkpoint)]
+            VcpuMsrsIncomplete {
+                expected,
+                actual,
+                first_failed,
+            } => write!(
+                f,
+                "KVM handled only {actual} of {expected} vCPU MSRs (stopped at MSR {first_failed:#x})"
+            ),
             VcpuSpawn(e) => write!(f, "Cannot spawn a new vCPU thread: {e}"),
             VcpuTlsInit => write!(f, "Cannot clean init vcpu TLS"),
             VcpuTlsNotPresent => write!(f, "Vcpu not present in TLS"),
@@ -841,9 +861,8 @@ impl Vm {
         &self.fd
     }
 
-    #[allow(unused)]
-    #[cfg(target_arch = "x86_64")]
-    /// Saves and returns the Kvm Vm state.
+    #[cfg(checkpoint)]
+    /// The VM-wide KVM state a checkpoint carries: PIT, PICs, IOAPIC and kvmclock.
     pub fn save_state(&self) -> Result<VmState> {
         let pitstate = self.fd.get_pit2().map_err(Error::VmGetPit2)?;
 
@@ -884,8 +903,7 @@ impl Vm {
         })
     }
 
-    #[allow(unused)]
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(checkpoint)]
     /// Restores the Kvm Vm state.
     pub fn restore_state(&self, state: &VmState) -> Result<()> {
         self.fd
@@ -905,8 +923,7 @@ impl Vm {
     }
 }
 
-#[allow(unused)]
-#[cfg(target_arch = "x86_64")]
+#[cfg(checkpoint)]
 /// Structure holding VM kvm state.
 pub struct VmState {
     pitstate: kvm_pit_state2,
@@ -914,6 +931,46 @@ pub struct VmState {
     pic_master: kvm_irqchip,
     pic_slave: kvm_irqchip,
     ioapic: kvm_irqchip,
+}
+
+#[cfg(checkpoint)]
+impl VmState {
+    pub(crate) fn encode(&self, enc: &mut Encoder) {
+        enc.pod(&self.pitstate);
+        enc.pod(&self.clock);
+        enc.pod(&self.pic_master);
+        enc.pod(&self.pic_slave);
+        enc.pod(&self.ioapic);
+    }
+
+    pub(crate) fn decode(dec: &mut Decoder) -> std::result::Result<Self, String> {
+        Ok(VmState {
+            pitstate: dec.pod()?,
+            clock: dec.pod()?,
+            pic_master: dec.pod()?,
+            pic_slave: dec.pod()?,
+            ioapic: dec.pod()?,
+        })
+    }
+}
+
+// SAFETY: KVM uapi structs: #[repr(C)] integers, arrays and unions of them.
+#[cfg(checkpoint)]
+mod pod {
+    use super::*;
+    unsafe impl Pod for kvm_pit_state2 {}
+    unsafe impl Pod for kvm_clock_data {}
+    unsafe impl Pod for kvm_irqchip {}
+    unsafe impl Pod for kvm_cpuid_entry2 {}
+    unsafe impl Pod for kvm_msr_entry {}
+    unsafe impl Pod for kvm_debugregs {}
+    unsafe impl Pod for kvm_lapic_state {}
+    unsafe impl Pod for kvm_mp_state {}
+    unsafe impl Pod for kvm_regs {}
+    unsafe impl Pod for kvm_sregs {}
+    unsafe impl Pod for kvm_vcpu_events {}
+    unsafe impl Pod for kvm_xcrs {}
+    unsafe impl Pod for kvm_xsave {}
 }
 
 /// Encapsulates configuration parameters for the guest vCPUS.
@@ -1351,8 +1408,7 @@ impl Vcpu {
         ))
     }
 
-    #[allow(unused)]
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(checkpoint)]
     fn save_state(&self) -> Result<VcpuState> {
         /*
          * Ordering requirements:
@@ -1396,7 +1452,7 @@ impl Vcpu {
         let debug_regs = self.fd.get_debug_regs().map_err(Error::VcpuGetDebugRegs)?;
         let lapic = self.fd.get_lapic().map_err(Error::VcpuGetLapic)?;
         let nmsrs = self.fd.get_msrs(&mut msrs).map_err(Error::VcpuGetMsrs)?;
-        assert_eq!(nmsrs, num_msrs);
+        msrs_complete(&msrs, nmsrs)?;
         let vcpu_events = self
             .fd
             .get_vcpu_events()
@@ -1415,9 +1471,8 @@ impl Vcpu {
         })
     }
 
-    #[allow(unused)]
-    #[cfg(target_arch = "x86_64")]
-    fn restore_state(&self, state: VcpuState) -> Result<()> {
+    #[cfg(checkpoint)]
+    fn restore_state(&mut self, state: VcpuState) -> Result<()> {
         /*
          * Ordering requirements:
          *
@@ -1443,6 +1498,8 @@ impl Vcpu {
         self.fd
             .set_cpuid2(&state.cpuid)
             .map_err(Error::VcpuSetCpuid)?;
+        // A later checkpoint of this vCPU must describe the CPUID now in KVM.
+        self.cpuid = state.cpuid;
         self.fd
             .set_mp_state(state.mp_state)
             .map_err(Error::VcpuSetMpState)?;
@@ -1462,7 +1519,10 @@ impl Vcpu {
         self.fd
             .set_lapic(&state.lapic)
             .map_err(Error::VcpuSetLapic)?;
-        self.fd.set_msrs(&state.msrs).map_err(Error::VcpuSetMsrs)?;
+        let nmsrs = self.fd.set_msrs(&state.msrs).map_err(Error::VcpuSetMsrs)?;
+        // A partial restore would resume the guest with some MSRs (say, the
+        // kvmclock page or the syscall entry) silently left at reset values.
+        msrs_complete(&state.msrs, nmsrs)?;
         self.fd
             .set_vcpu_events(&state.vcpu_events)
             .map_err(Error::VcpuSetVcpuEvents)?;
@@ -1667,6 +1727,21 @@ impl Vcpu {
                     .send(VcpuResponse::Resumed)
                     .expect("failed to send resume status");
             }
+            // A checkpoint is only consistent from a parked vCPU; the VMM
+            // always pauses first, so this is a VMM bug. Answer rather than
+            // leave the caller waiting.
+            #[cfg(checkpoint)]
+            Ok(VcpuEvent::SaveState) => {
+                let _ = self.response_sender.send(VcpuResponse::SaveFailed(
+                    "vCPU is running; pause it first".into(),
+                ));
+            }
+            #[cfg(checkpoint)]
+            Ok(VcpuEvent::RestoreState(_)) => {
+                let _ = self.response_sender.send(VcpuResponse::RestoreFailed(
+                    "vCPU is running; pause it first".into(),
+                ));
+            }
             // Unhandled exit of the other end.
             Err(TryRecvError::Disconnected) => {
                 // Move to 'exited' state.
@@ -1723,6 +1798,37 @@ impl Vcpu {
                     .expect("failed to send resume status");
                 // Move to 'running' state.
                 StateMachine::next(Self::running)
+            }
+            // KVM_GET_VCPU_EVENTS is only safe while every vCPU is out of
+            // KVM_RUN, so state moves happen here, in the paused loop, and
+            // the vCPU stays paused.
+            #[cfg(checkpoint)]
+            Ok(VcpuEvent::SaveState) => {
+                let response = match self.save_state() {
+                    Ok(state) => VcpuResponse::SavedState(Box::new(state)),
+                    Err(e) => VcpuResponse::SaveFailed(e.to_string()),
+                };
+                self.response_sender
+                    .send(response)
+                    .expect("failed to send saved vcpu state");
+                StateMachine::next(Self::paused)
+            }
+            #[cfg(checkpoint)]
+            Ok(VcpuEvent::RestoreState(state)) => {
+                let response = match self.restore_state(*state) {
+                    Ok(()) => {
+                        // The guest was frozen while it sat on disk: on resume,
+                        // tell it (KVM_KVMCLOCK_CTRL) so its soft-lockup
+                        // watchdog doesn't count the gap as a hung CPU.
+                        self.pause_clock.live = true;
+                        VcpuResponse::RestoredState
+                    }
+                    Err(e) => VcpuResponse::RestoreFailed(e.to_string()),
+                };
+                self.response_sender
+                    .send(response)
+                    .expect("failed to send vcpu restore status");
+                StateMachine::next(Self::paused)
             }
             // All other events have no effect on current 'paused' state.
             Ok(_) => StateMachine::next(Self::paused),
@@ -1782,7 +1888,7 @@ impl Drop for Vcpu {
     }
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(checkpoint)]
 /// Structure holding VCPU kvm state.
 pub struct VcpuState {
     cpuid: CpuId,
@@ -1797,8 +1903,64 @@ pub struct VcpuState {
     xsave: kvm_xsave,
 }
 
-// Allow currently unused Pause and Exit events. These will be used by the vmm later on.
-#[allow(unused)]
+#[cfg(checkpoint)]
+impl std::fmt::Debug for VcpuState {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        // Kilobytes of raw registers; a marker keeps `VcpuEvent: Debug` cheap.
+        f.write_str("VcpuState { .. }")
+    }
+}
+
+#[cfg(checkpoint)]
+impl VcpuState {
+    pub(crate) fn encode(&self, enc: &mut Encoder) {
+        enc.pods(self.cpuid.as_slice());
+        enc.pods(self.msrs.as_slice());
+        enc.pod(&self.debug_regs);
+        enc.pod(&self.lapic);
+        enc.pod(&self.mp_state);
+        enc.pod(&self.regs);
+        enc.pod(&self.sregs);
+        enc.pod(&self.vcpu_events);
+        enc.pod(&self.xcrs);
+        enc.pod(&self.xsave);
+    }
+
+    pub(crate) fn decode(dec: &mut Decoder) -> std::result::Result<Self, String> {
+        let cpuid = CpuId::from_entries(&dec.pods::<kvm_cpuid_entry2>()?)
+            .map_err(|e| format!("corrupt CPUID: {e:?}"))?;
+        let msrs = Msrs::from_entries(&dec.pods::<kvm_msr_entry>()?)
+            .map_err(|e| format!("corrupt MSR list: {e:?}"))?;
+        Ok(VcpuState {
+            cpuid,
+            msrs,
+            debug_regs: dec.pod()?,
+            lapic: dec.pod()?,
+            mp_state: dec.pod()?,
+            regs: dec.pod()?,
+            sregs: dec.pod()?,
+            vcpu_events: dec.pod()?,
+            xcrs: dec.pod()?,
+            xsave: dec.pod()?,
+        })
+    }
+}
+
+/// Fails unless KVM read or wrote every MSR in `msrs` (`done` is what the
+/// ioctl returned: it stops at the first MSR it can't handle).
+#[cfg(checkpoint)]
+fn msrs_complete(msrs: &Msrs, done: usize) -> Result<()> {
+    let entries = msrs.as_slice();
+    if done == entries.len() {
+        return Ok(());
+    }
+    Err(Error::VcpuMsrsIncomplete {
+        expected: entries.len(),
+        actual: done,
+        first_failed: entries.get(done).map_or(0, |e| e.index),
+    })
+}
+
 #[derive(Debug)]
 /// List of events that the Vcpu can receive.
 pub enum VcpuEvent {
@@ -1806,10 +1968,15 @@ pub enum VcpuEvent {
     Pause,
     /// Event that should resume the Vcpu.
     Resume,
-    // Serialize and Deserialize to follow after we get the support from kvm-ioctls.
+    /// Capture the paused vCPU's state for a checkpoint.
+    #[cfg(checkpoint)]
+    SaveState,
+    /// Load checkpointed state into the paused vCPU.
+    #[cfg(checkpoint)]
+    RestoreState(Box<VcpuState>),
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug)]
 #[allow(dead_code)]
 /// List of responses that the Vcpu reports.
 pub enum VcpuResponse {
@@ -1819,6 +1986,14 @@ pub enum VcpuResponse {
     Resumed,
     /// Vcpu is stopped.
     Exited(u8),
+    #[cfg(checkpoint)]
+    SavedState(Box<VcpuState>),
+    #[cfg(checkpoint)]
+    SaveFailed(String),
+    #[cfg(checkpoint)]
+    RestoredState,
+    #[cfg(checkpoint)]
+    RestoreFailed(String),
 }
 
 /// Wrapper over Vcpu that hides the underlying interactions with the Vcpu thread.
@@ -2137,5 +2312,159 @@ mod tests {
     #[test]
     fn test_vcpu_rtsig_offset() {
         assert!(validate_signal_num(sigrtmin() + VCPU_RTSIG_OFFSET).is_ok());
+    }
+
+    /// A vCPU configured for boot, then given distinctive register and MSR
+    /// values, as a checkpoint source.
+    #[cfg(checkpoint)]
+    fn distinctive_vcpu() -> (Vm, Vcpu, GuestMemoryMmap, kvm_regs) {
+        use arch_gen::x86::msr_index::{MSR_KERNEL_GS_BASE, MSR_LSTAR};
+
+        let (vm, mut vcpu, mem) = setup_vcpu(0x10000);
+        let config = VcpuConfig {
+            vcpu_count: 1,
+            ht_enabled: false,
+            cpu_template: None,
+            nested_enabled: false,
+        };
+        vcpu.configure_x86_64(&mem, GuestAddress(0x1000), &config, true, false)
+            .unwrap();
+        let mut regs = vcpu.fd.get_regs().unwrap();
+        regs.rax = 0x1122_3344_5566_7788;
+        regs.r15 = 0xdead_beef;
+        vcpu.fd.set_regs(&regs).unwrap();
+        let msrs = Msrs::from_entries(&[
+            kvm_msr_entry {
+                index: MSR_LSTAR,
+                data: 0xffff_ffff_8100_0000,
+                ..Default::default()
+            },
+            kvm_msr_entry {
+                index: MSR_KERNEL_GS_BASE,
+                data: 0xffff_8880_0000_1000,
+                ..Default::default()
+            },
+        ])
+        .unwrap();
+        assert_eq!(vcpu.fd.set_msrs(&msrs).unwrap(), 2);
+        (vm, vcpu, mem, regs)
+    }
+
+    #[cfg(checkpoint)]
+    fn reencode(state: VcpuState) -> VcpuState {
+        let mut enc = Encoder::new();
+        state.encode(&mut enc);
+        let bytes = enc.into_bytes();
+        let mut dec = Decoder::new(&bytes);
+        let state = VcpuState::decode(&mut dec).unwrap();
+        dec.finish().unwrap();
+        state
+    }
+
+    #[cfg(checkpoint)]
+    #[test]
+    fn vcpu_state_survives_encoding_into_a_fresh_vcpu() {
+        use arch_gen::x86::msr_index::{MSR_KERNEL_GS_BASE, MSR_LSTAR};
+
+        let (_vm, vcpu, _mem, regs) = distinctive_vcpu();
+        let sregs = vcpu.fd.get_sregs().unwrap();
+        let xsave = vcpu.fd.get_xsave().unwrap();
+        let lapic = vcpu.fd.get_lapic().unwrap();
+
+        let state = reencode(vcpu.save_state().unwrap());
+
+        // A different VM, as a restore in a new process gets.
+        let (_vm2, mut fresh, _mem2) = setup_vcpu(0x10000);
+        fresh.restore_state(state).unwrap();
+
+        assert_eq!(fresh.fd.get_regs().unwrap(), regs);
+        assert_eq!(fresh.fd.get_sregs().unwrap(), sregs);
+        assert_eq!(fresh.fd.get_xsave().unwrap().region, xsave.region);
+        // The LAPIC timer's current count (0x390) runs; nothing else may move.
+        let (before, after) = (lapic.regs, fresh.fd.get_lapic().unwrap().regs);
+        assert_eq!(before[..0x390], after[..0x390]);
+        assert_eq!(before[0x3a0..], after[0x3a0..]);
+        let mut msrs = Msrs::from_entries(&[
+            kvm_msr_entry {
+                index: MSR_LSTAR,
+                ..Default::default()
+            },
+            kvm_msr_entry {
+                index: MSR_KERNEL_GS_BASE,
+                ..Default::default()
+            },
+        ])
+        .unwrap();
+        assert_eq!(fresh.fd.get_msrs(&mut msrs).unwrap(), 2);
+        assert_eq!(msrs.as_slice()[0].data, 0xffff_ffff_8100_0000);
+        assert_eq!(msrs.as_slice()[1].data, 0xffff_8880_0000_1000);
+    }
+
+    #[cfg(checkpoint)]
+    #[test]
+    fn partial_msr_restore_is_an_error() {
+        let (_vm, vcpu, _mem, _) = distinctive_vcpu();
+        let mut state = vcpu.save_state().unwrap();
+        // An MSR KVM refuses to write, in the middle of the list.
+        let mut entries = state.msrs.as_slice().to_vec();
+        let at = entries.len() / 2;
+        entries.insert(
+            at,
+            kvm_msr_entry {
+                index: 0xdead,
+                ..Default::default()
+            },
+        );
+        state.msrs = Msrs::from_entries(&entries).unwrap();
+
+        let (_vm2, mut fresh, _mem2) = setup_vcpu(0x10000);
+        match fresh.restore_state(state) {
+            Err(Error::VcpuMsrsIncomplete {
+                actual,
+                first_failed,
+                ..
+            }) => {
+                assert_eq!(actual, at);
+                assert_eq!(first_failed, 0xdead);
+            }
+            other => panic!("partial MSR restore returned {other:?}"),
+        }
+    }
+
+    #[cfg(checkpoint)]
+    #[test]
+    fn vm_state_survives_encoding_into_a_fresh_vm() {
+        let (vm, _vcpu, _mem) = setup_vcpu(0x1000);
+        let mut pit = vm.fd.get_pit2().unwrap();
+        pit.channels[0].count = 0x1234;
+        pit.channels[2].mode = 3;
+        vm.fd.set_pit2(&pit).unwrap();
+        let mut ioapic = kvm_irqchip {
+            chip_id: KVM_IRQCHIP_IOAPIC,
+            ..Default::default()
+        };
+        vm.fd.get_irqchip(&mut ioapic).unwrap();
+        // Unmask a redirection entry, as a booted guest does for its devices.
+        unsafe { ioapic.chip.ioapic.redirtbl[5].bits = 0x31 };
+        vm.fd.set_irqchip(&ioapic).unwrap();
+
+        let mut enc = Encoder::new();
+        vm.save_state().unwrap().encode(&mut enc);
+        let bytes = enc.into_bytes();
+        let mut dec = Decoder::new(&bytes);
+        let state = VmState::decode(&mut dec).unwrap();
+        dec.finish().unwrap();
+
+        let (vm2, _vcpu2, _mem2) = setup_vcpu(0x1000);
+        vm2.restore_state(&state).unwrap();
+        let restored = vm2.fd.get_pit2().unwrap();
+        assert_eq!(restored.channels[0].count, 0x1234);
+        assert_eq!(restored.channels[2].mode, 3);
+        let mut got = kvm_irqchip {
+            chip_id: KVM_IRQCHIP_IOAPIC,
+            ..Default::default()
+        };
+        vm2.fd.get_irqchip(&mut got).unwrap();
+        assert_eq!(unsafe { got.chip.ioapic.redirtbl[5].bits }, 0x31);
     }
 }
