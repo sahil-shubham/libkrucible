@@ -18,16 +18,23 @@ pub(crate) fn process_rx(
     port_id: u32,
     stopfd: utils::eventfd::EventFd,
     stop: Arc<AtomicBool>,
-) {
+) -> Queue {
     let mem = &mem;
     let mut eof = false;
 
     let mut input = input.lock().unwrap();
     loop {
         let Some(head) = pop_head_blocking(&mut queue, mem, &interrupt, &stop) else {
-            return;
+            return queue;
         };
 
+        #[cfg(windows)]
+        {
+            input.wait_until_readable(Some(&stopfd));
+            if stop.load(Ordering::Acquire) {
+                return queue;
+            }
+        }
         let head_index = head.index;
         let mut bytes_read = 0;
         for chain in head.into_iter().writable() {
@@ -56,7 +63,7 @@ pub(crate) fn process_rx(
             interrupt.signal_used_queue();
             log::trace!("signaling EOF on port {port_id}");
             control.port_open(port_id, false);
-            return;
+            return queue;
         } else if bytes_read == 0 {
             queue.undo_pop();
             interrupt.signal_used_queue();
@@ -64,7 +71,7 @@ pub(crate) fn process_rx(
         }
 
         if stop.load(Ordering::Acquire) {
-            return;
+            return queue;
         }
     }
 }

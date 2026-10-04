@@ -82,15 +82,25 @@ impl BlockWorker {
             stop_fd,
         }
     }
+    pub(crate) fn save_queue_state(&self) -> crate::virtio::QueueState {
+        self.device_queue.queue.save_state()
+    }
 
-    pub fn run(self) -> thread::JoinHandle<()> {
+    pub(crate) fn restore_queue_state(
+        &mut self,
+        state: &crate::virtio::QueueState,
+    ) -> Result<(), String> {
+        self.device_queue.queue.restore_state(state)
+    }
+
+    pub fn run(self) -> thread::JoinHandle<BlockWorker> {
         thread::Builder::new()
             .name("block worker".into())
             .spawn(|| self.work())
             .unwrap()
     }
 
-    fn work(mut self) {
+    fn work(mut self) -> BlockWorker {
         let virtq_ev_fd = self.device_queue.event.as_raw_fd();
         let stop_ev_fd = self.stop_fd.as_raw_fd();
 
@@ -122,7 +132,8 @@ impl BlockWorker {
                             EventSet::IN if source == stop_ev_fd => {
                                 debug!("stopping worker thread");
                                 let _ = self.stop_fd.read();
-                                return;
+                                self.process_virtio_queues();
+                                return self;
                             }
                             _ => {
                                 log::warn!(

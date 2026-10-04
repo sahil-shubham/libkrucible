@@ -64,8 +64,10 @@ enum PortState {
     Active {
         stopfd: utils::eventfd::EventFd,
         stop: Arc<AtomicBool>,
-        rx_thread: Option<JoinHandle<()>>,
-        tx_thread: Option<JoinHandle<()>>,
+        rx_thread: Option<JoinHandle<Queue>>,
+        tx_thread: Option<JoinHandle<Queue>>,
+        idle_rx: Option<Queue>,
+        idle_tx: Option<Queue>,
     },
 }
 
@@ -140,63 +142,94 @@ impl Port {
             .expect("Failed to create EventFd for interrupt_evt");
         let stop = Arc::new(AtomicBool::new(false));
 
-        let rx_thread = input.map(|input| {
-            let mem = mem.clone();
-            let interrupt = interrupt.clone();
-            let port_id = self.port_id;
-            let stopfd = stopfd.try_clone().unwrap();
-            let stop = stop.clone();
-            thread::Builder::new()
-                .name("console port".into())
-                .spawn(move || {
-                    process_rx(
-                        mem, rx_queue, interrupt, input, control, port_id, stopfd, stop,
-                    )
-                })
-                .unwrap()
-        });
-
-        let tx_thread = output.map(|output| {
-            let stop = stop.clone();
-            thread::spawn(move || process_tx(mem, tx_queue, interrupt, output, stop))
-        });
+        let (rx_thread, idle_rx) = match input {
+            Some(input) => {
+                let mem = mem.clone();
+                let interrupt = interrupt.clone();
+                let port_id = self.port_id;
+                let stopfd = stopfd.try_clone().unwrap();
+                let stop = stop.clone();
+                let thread = thread::Builder::new()
+                    .name("console port".into())
+                    .spawn(move || {
+                        process_rx(
+                            mem, rx_queue, interrupt, input, control, port_id, stopfd, stop,
+                        )
+                    })
+                    .unwrap();
+                (Some(thread), None)
+            }
+            None => (None, Some(rx_queue)),
+        };
+        let (tx_thread, idle_tx) = match output {
+            Some(output) => {
+                let stop = stop.clone();
+                (
+                    Some(thread::spawn(move || {
+                        process_tx(mem, tx_queue, interrupt, output, stop)
+                    })),
+                    None,
+                )
+            }
+            None => (None, Some(tx_queue)),
+        };
 
         self.state = PortState::Active {
             stopfd,
             stop,
             rx_thread,
             tx_thread,
+            idle_rx,
+            idle_tx,
         }
     }
 
     pub fn shutdown(&mut self) {
+        let _ = self.shutdown_and_reclaim();
+    }
+
+    /// Return both queues even when a port has no input or output thread.
+    pub(crate) fn shutdown_and_reclaim(&mut self) -> ReclaimedQueues {
+        let mut reclaimed = ReclaimedQueues::default();
         if let PortState::Active {
             stopfd,
             stop,
             tx_thread,
             rx_thread,
+            idle_rx,
+            idle_tx,
         } = &mut self.state
         {
+            reclaimed.rx = idle_rx.take();
+            reclaimed.tx = idle_tx.take();
             stop.store(true, Ordering::Release);
             if let Some(tx_thread) = mem::take(tx_thread) {
                 tx_thread.thread().unpark();
-                if let Err(e) = tx_thread.join() {
-                    log::error!(
-                        "Failed to flush tx for port {port_id}, thread panicked: {e:?}",
-                        port_id = self.port_id
-                    )
+                match tx_thread.join() {
+                    Ok(q) => reclaimed.tx = Some(q),
+                    Err(error) => log::error!("console: tx worker panicked: {error:?}"),
                 }
             }
-            stopfd.write(1).unwrap();
+            let _ = stopfd.write(1);
             if let Some(rx_thread) = mem::take(rx_thread) {
                 rx_thread.thread().unpark();
-                if let Err(e) = rx_thread.join() {
-                    log::error!(
-                        "Failed to flush tx for port {port_id}, thread panicked: {e:?}",
-                        port_id = self.port_id
-                    )
+                match rx_thread.join() {
+                    Ok(q) => reclaimed.rx = Some(q),
+                    Err(error) => log::error!("console: rx worker panicked: {error:?}"),
                 }
             }
-        };
+        }
+        self.state = PortState::Inactive;
+        reclaimed
     }
+
+    pub(crate) fn is_active(&self) -> bool {
+        matches!(self.state, PortState::Active { .. })
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct ReclaimedQueues {
+    pub rx: Option<Queue>,
+    pub tx: Option<Queue>,
 }

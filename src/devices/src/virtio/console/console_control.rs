@@ -129,6 +129,24 @@ impl ConsoleControl {
         let mut queue = self.queue.lock().expect("Poisoned lock");
         queue.pop_front()
     }
+    /// Preserve replies created after guest control messages but not yet consumed.
+    pub fn snapshot_pending(&self) -> Vec<Vec<u8>> {
+        self.queue
+            .lock()
+            .expect("Poisoned lock")
+            .iter()
+            .map(|payload| payload.to_vec())
+            .collect()
+    }
+
+    pub fn restore_pending(&self, pending: &[Vec<u8>]) {
+        let mut queue = self.queue.lock().expect("Poisoned lock");
+        queue.clear();
+        queue.extend(pending.iter().cloned().map(Payload::Bytes));
+        if !pending.is_empty() {
+            let _ = self.queue_evt.write(1);
+        }
+    }
 
     pub fn queue_evt(&self) -> &EventFd {
         &self.queue_evt

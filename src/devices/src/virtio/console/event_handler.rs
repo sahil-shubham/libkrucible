@@ -12,6 +12,52 @@ use crate::virtio::console::port_queue_mapping::{QueueDirection, queue_idx_to_po
 use crate::virtio::device::VirtioDevice;
 
 impl Console {
+    fn defer_snapshot_event(&mut self, event: &EpollEvent) -> bool {
+        if !self.snapshot_quiesced {
+            return false;
+        }
+        let source = event.fd();
+        let notification = self
+            .queue_events
+            .iter()
+            .map(|fd| fd.as_ref())
+            .chain([
+                &self.activate_evt,
+                &self.sigwinch_evt,
+                self.control.queue_evt(),
+            ])
+            .enumerate()
+            .find(|(_, fd)| fd.as_raw_fd() == source);
+        if let Some((index, notification)) = notification {
+            if notification.read().is_ok() && !self.deferred_events.contains(&index) {
+                self.deferred_events.push(index);
+            }
+        } else {
+            warn!("console: unknown paused event {source:?}");
+        }
+        true
+    }
+
+    pub(crate) fn replay_deferred_events(&mut self) {
+        for index in std::mem::take(&mut self.deferred_events) {
+            let notification = self
+                .queue_events
+                .iter()
+                .map(|fd| fd.as_ref())
+                .chain([
+                    &self.activate_evt,
+                    &self.sigwinch_evt,
+                    self.control.queue_evt(),
+                ])
+                .nth(index);
+            if let Some(notification) = notification
+                && let Err(error) = notification.write(1)
+            {
+                error!("console: failed to replay paused event: {error}");
+            }
+        }
+    }
+
     pub(crate) fn read_queue_event(&self, queue_index: usize, event: &EpollEvent) -> bool {
         log::trace!("Event on queue {queue_index}: {:?}", event.event_set());
 
@@ -119,6 +165,9 @@ impl Subscriber for Console {
         let sigwinch_evt = self.sigwinch_evt.as_raw_fd();
 
         if self.is_activated() {
+            if self.defer_snapshot_event(event) {
+                return;
+            }
             // interest_list() registers sigwinch_evt and control.queue_evt() with
             // epoll at creation time, but queue_events is only populated later in
             // activate(). If a spurious event arrives before activation, indexing

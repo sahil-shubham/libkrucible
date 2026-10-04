@@ -12,7 +12,7 @@ use utils::eventfd::EventFd;
 use vm_memory::{ByteValued, Bytes, GuestMemoryMmap};
 
 use super::super::{
-    ActivateError, ActivateResult, DeviceQueue, DeviceState, QueueConfig, VirtioDevice,
+    ActivateError, ActivateResult, DeviceQueue, DeviceState, QueueConfig, QueueState, VirtioDevice,
 };
 use super::{defs, defs::control_event, defs::uapi};
 use crate::virtio::console::console_control::{
@@ -71,6 +71,9 @@ pub struct Console {
 
     pub(crate) activate_evt: EventFd,
     pub(crate) sigwinch_evt: EventFd,
+    pub(crate) snapshot_quiesced: bool,
+    snapshot_error: Option<String>,
+    pub(crate) deferred_events: Vec<usize>,
 
     config: VirtioConsoleConfig,
 }
@@ -106,6 +109,9 @@ impl Console {
                 .map_err(super::ConsoleError::EventFd)?,
             sigwinch_evt: EventFd::new(utils::eventfd::EFD_NONBLOCK)
                 .map_err(super::ConsoleError::EventFd)?,
+            snapshot_quiesced: false,
+            snapshot_error: None,
+            deferred_events: Vec::new(),
             device_state: DeviceState::Inactive,
             config,
         })
@@ -256,6 +262,10 @@ impl Console {
         }
 
         for port_id in ports_to_start {
+            // The restored guest can have a pending duplicate PORT_OPEN command.
+            if self.ports[port_id].is_active() {
+                continue;
+            }
             log::trace!("Starting port io for port {port_id}");
             let rx_idx = port_id_to_queue_idx(QueueDirection::Rx, port_id);
             let tx_idx = port_id_to_queue_idx(QueueDirection::Tx, port_id);
@@ -280,6 +290,93 @@ impl Console {
         }
 
         raise_irq
+    }
+}
+
+/// Host resources are reconstructed; every port queue must be reclaimed first.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ConsoleState {
+    pub acked_features: u64,
+    pub activated: bool,
+    pub queues: Vec<Option<QueueState>>,
+    pub pending_control: Vec<Vec<u8>>,
+}
+
+impl Console {
+    pub fn save_state(&self) -> ConsoleState {
+        ConsoleState {
+            acked_features: self.acked_features,
+            activated: self.device_state.is_activated(),
+            queues: self
+                .queues
+                .iter()
+                .map(|q| q.as_ref().map(|dq| dq.queue.save_state()))
+                .collect(),
+            pending_control: self.control.snapshot_pending(),
+        }
+    }
+
+    pub fn restore_state(&mut self, state: &ConsoleState) -> Result<(), String> {
+        if state.activated && state.queues.len() != self.queue_config.len() {
+            return Err("console queue count differs from checkpoint".into());
+        }
+        for (slot, saved) in self.queues.iter_mut().zip(state.queues.iter()) {
+            if let (Some(queue), Some(saved)) = (slot, saved) {
+                queue.queue.restore_state(saved)?;
+            }
+        }
+        self.acked_features = state.acked_features;
+        self.control.restore_pending(&state.pending_control);
+        Ok(())
+    }
+
+    fn quiesce_ports_for_snapshot(&mut self) {
+        for port_id in 0..self.ports.len() {
+            if !self.ports[port_id].is_active() {
+                continue;
+            }
+            let reclaimed = self.ports[port_id].shutdown_and_reclaim();
+            if reclaimed.rx.is_none() || reclaimed.tx.is_none() {
+                self.snapshot_error.get_or_insert_with(|| {
+                    format!("console port {port_id} lost a checkpoint queue")
+                });
+            }
+            for (direction, queue) in [
+                (QueueDirection::Rx, reclaimed.rx),
+                (QueueDirection::Tx, reclaimed.tx),
+            ] {
+                if let Some(queue) = queue {
+                    let index = port_id_to_queue_idx(direction, port_id);
+                    self.queues[index] =
+                        Some(DeviceQueue::new(queue, self.queue_events[index].clone()));
+                }
+            }
+        }
+    }
+
+    fn start_ports_after_restore(&mut self) {
+        let DeviceState::Activated(mem, interrupt) = &self.device_state else {
+            return;
+        };
+        for port_id in 0..self.ports.len() {
+            if self.ports[port_id].is_active() {
+                continue;
+            }
+            let rx_idx = port_id_to_queue_idx(QueueDirection::Rx, port_id);
+            let tx_idx = port_id_to_queue_idx(QueueDirection::Tx, port_id);
+            if self.queues[rx_idx].is_none() || self.queues[tx_idx].is_none() {
+                continue;
+            }
+            let rx = self.queues[rx_idx].take().unwrap();
+            let tx = self.queues[tx_idx].take().unwrap();
+            self.ports[port_id].start(
+                mem.clone(),
+                rx.queue,
+                tx.queue,
+                interrupt.clone(),
+                self.control.clone(),
+            );
+        }
     }
 }
 
@@ -360,7 +457,44 @@ impl VirtioDevice for Console {
         self.queues.clear();
         self.queue_events.clear();
         self.device_state = DeviceState::Inactive;
+        self.snapshot_quiesced = false;
+        self.snapshot_error = None;
+        self.deferred_events.clear();
         true
+    }
+
+    fn quiesce_for_snapshot(&mut self) {
+        if !self.snapshot_quiesced {
+            self.snapshot_quiesced = true;
+            self.quiesce_ports_for_snapshot();
+        }
+    }
+
+    fn snapshot_error(&self) -> Option<&str> {
+        self.snapshot_error.as_deref()
+    }
+
+    fn rearm_after_snapshot(&mut self) {
+        if self.snapshot_quiesced {
+            self.snapshot_quiesced = false;
+            self.start_ports_after_restore();
+            self.replay_deferred_events();
+        }
+    }
+
+    fn finish_restore_activation(&mut self) {
+        self.start_ports_after_restore();
+        if self.is_activated() {
+            for event in [
+                self.queue_events[CONTROL_RXQ_INDEX].as_ref(),
+                self.queue_events[CONTROL_TXQ_INDEX].as_ref(),
+                self.control.queue_evt(),
+            ] {
+                if let Err(error) = event.write(1) {
+                    error!("console: failed to notify restored control queue: {error}");
+                }
+            }
+        }
     }
 }
 
@@ -368,5 +502,83 @@ impl VmmExitObserver for Console {
     fn on_vmm_exit(&mut self) {
         self.reset();
         log::trace!("Console on_vmm_exit finished");
+    }
+}
+
+#[cfg(test)]
+mod checkpoint_boundary_tests {
+    use super::*;
+    use crate::legacy::DummyIrqChip;
+    use polly::event_manager::{EventManager, Subscriber};
+    use std::os::fd::AsRawFd;
+    use utils::epoll::{EpollEvent, EventSet};
+    use vm_memory::GuestAddress;
+
+    fn console() -> Console {
+        Console::new(vec![PortDescription {
+            name: "".into(),
+            input: None,
+            output: None,
+            terminal: None,
+        }])
+        .unwrap()
+    }
+
+    fn activate_console(device: &mut Console) {
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let irq =
+            InterruptTransport::new(DummyIrqChip::new().into(), "test-console".into()).unwrap();
+        let queues: Vec<_> = device
+            .queue_config()
+            .iter()
+            .map(|config| {
+                DeviceQueue::new(
+                    crate::virtio::Queue::new(config.size),
+                    Arc::new(EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap()),
+                )
+            })
+            .collect();
+        device.activate(mem, irq, queues).unwrap();
+    }
+
+    #[test]
+    fn pending_control_replies_survive_save_restore() {
+        let mut source = console();
+        source.control.port_add(0);
+        source.control.port_name(0, "restored");
+        activate_console(&mut source);
+        source.quiesce_for_snapshot();
+        let state = source.save_state();
+        assert_eq!(state.pending_control.len(), 2);
+        let bytes = serde_json::to_vec(&state).unwrap();
+        let decoded: ConsoleState = serde_json::from_slice(&bytes).unwrap();
+        let mut target = console();
+        target.restore_state(&decoded).unwrap();
+        let replies: Vec<_> =
+            std::iter::from_fn(|| target.control.queue_pop().map(|p| p.to_vec())).collect();
+        assert_eq!(replies, state.pending_control);
+        assert!(target.control.queue_pop().is_none());
+    }
+
+    #[test]
+    fn quiesced_console_replays_consumed_notification_on_rearm() {
+        let mut device = console();
+        activate_console(&mut device);
+        device.quiesce_for_snapshot();
+        let eventfd = device.queue_events[CONTROL_RXQ_INDEX].clone();
+        eventfd.write(1).unwrap();
+        device.process(
+            &EpollEvent::new(EventSet::IN, eventfd.as_raw_fd() as u64),
+            &mut EventManager::new().unwrap(),
+        );
+        assert_eq!(device.deferred_events, vec![CONTROL_RXQ_INDEX]);
+        assert_eq!(
+            eventfd.read().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        device.rearm_after_snapshot();
+        assert!(device.deferred_events.is_empty());
+        assert_eq!(eventfd.read().unwrap(), 1);
+        device.reset();
     }
 }

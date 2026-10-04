@@ -7,7 +7,7 @@ pub mod device;
 mod worker;
 
 #[cfg(feature = "blk")]
-pub use self::device::{Block, CacheType};
+pub use self::device::{Block, BlockState, CacheType};
 
 use vm_memory::GuestMemoryError;
 

@@ -40,7 +40,9 @@ use windows_sys::Win32::Storage::FileSystem::{
 
 use super::worker::BlockWorker;
 use super::{
-    super::{ActivateResult, DeviceQueue, DeviceState, QueueConfig, TYPE_BLOCK, VirtioDevice},
+    super::{
+        ActivateResult, DeviceQueue, DeviceState, QueueConfig, QueueState, TYPE_BLOCK, VirtioDevice,
+    },
     Error, NUM_QUEUES, QUEUE_CONFIG, SECTOR_SHIFT, SECTOR_SIZE,
 };
 
@@ -244,8 +246,10 @@ pub struct Block {
     cache_type: CacheType,
     disk_image: Arc<Mutex<FormatAccess<Box<dyn DynStorage>>>>,
     disk_image_id: Vec<u8>,
-    worker_thread: Option<JoinHandle<()>>,
+    worker_thread: Option<JoinHandle<BlockWorker>>,
     worker_stopfd: EventFd,
+    quiesced_worker: Option<BlockWorker>,
+    snapshot_error: Option<String>,
 
     // Virtio fields.
     pub(crate) avail_features: u64,
@@ -362,6 +366,8 @@ impl Block {
             device_state: DeviceState::Inactive,
             worker_thread: None,
             worker_stopfd: EventFd::new(EFD_NONBLOCK)?,
+            quiesced_worker: None,
+            snapshot_error: None,
         })
     }
 
@@ -378,6 +384,53 @@ impl Block {
     /// Specifies if this block device is read only.
     pub fn is_read_only(&self) -> bool {
         self.avail_features & (1u64 << VIRTIO_BLK_F_RO) != 0
+    }
+}
+
+/// A disk's identity and queue position at the drained checkpoint boundary.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct BlockState {
+    pub acked_features: u64,
+    pub activated: bool,
+    pub disk_image_id: Vec<u8>,
+    pub capacity: u64,
+    pub queue: Option<QueueState>,
+}
+
+impl Block {
+    pub fn save_state(&self) -> BlockState {
+        BlockState {
+            acked_features: self.acked_features,
+            activated: self.device_state.is_activated(),
+            disk_image_id: self.disk_image_id.clone(),
+            capacity: self.config.capacity,
+            queue: self
+                .quiesced_worker
+                .as_ref()
+                .map(BlockWorker::save_queue_state),
+        }
+    }
+
+    /// A different disk silently corrupts the guest's restored filesystem.
+    pub fn restore_state(&mut self, state: &BlockState) -> Result<(), String> {
+        if self.disk_image_id != state.disk_image_id {
+            return Err(format!(
+                "block {}: disk image id differs from checkpoint",
+                self.id
+            ));
+        }
+        let capacity = self.config.capacity;
+        if capacity != state.capacity {
+            return Err(format!(
+                "block {}: capacity {} differs from checkpoint {}",
+                self.id, capacity, state.capacity
+            ));
+        }
+        if let (Some(worker), Some(queue)) = (self.quiesced_worker.as_mut(), state.queue.as_ref()) {
+            worker.restore_queue_state(queue)?;
+        }
+        self.acked_features = state.acked_features;
+        Ok(())
     }
 }
 
@@ -473,8 +526,49 @@ impl VirtioDevice for Block {
                 error!("error waiting for worker thread: {e:?}");
             }
         }
+        self.quiesced_worker = None;
+        self.snapshot_error = None;
         self.device_state = DeviceState::Inactive;
         true
+    }
+
+    fn quiesce_for_snapshot(&mut self) {
+        if let Some(handle) = self.worker_thread.take() {
+            if let Err(error) = self.worker_stopfd.write(1) {
+                self.snapshot_error
+                    .get_or_insert_with(|| format!("block worker stop: {error}"));
+            }
+            match handle.join() {
+                Ok(worker) => self.quiesced_worker = Some(worker),
+                Err(error) => {
+                    error!("block: worker failed during checkpoint: {error:?}");
+                    self.snapshot_error
+                        .get_or_insert_with(|| "block worker failed before checkpoint".into());
+                }
+            }
+        }
+        if self.cache_type == CacheType::Writeback {
+            let disk = self.disk_image.lock().unwrap();
+            if let Err(error) = disk.flush() {
+                self.snapshot_error.get_or_insert_with(|| {
+                    format!("block flush failed before checkpoint: {error}")
+                });
+            }
+            if let Err(error) = disk.sync() {
+                self.snapshot_error
+                    .get_or_insert_with(|| format!("block sync failed before checkpoint: {error}"));
+            }
+        }
+    }
+
+    fn snapshot_error(&self) -> Option<&str> {
+        self.snapshot_error.as_deref()
+    }
+
+    fn rearm_after_snapshot(&mut self) {
+        if let Some(worker) = self.quiesced_worker.take() {
+            self.worker_thread = Some(worker.run());
+        }
     }
 }
 
@@ -482,7 +576,108 @@ impl VirtioDevice for Block {
 mod tests {
     use super::*;
 
+    use crate::legacy::DummyIrqChip;
+    use crate::virtio::queue::tests::VirtQueue;
+    use std::os::unix::fs::FileExt;
+    use std::time::{Duration, Instant};
     use utils::tempfile::TempFile;
+    use vm_memory::{Bytes, GuestAddress};
+
+    fn test_block(file: &TempFile, id: &str) -> Block {
+        Block::new(
+            id.into(),
+            None,
+            CacheType::Writeback,
+            file.as_path().to_str().unwrap().into(),
+            DiskFormat::Raw,
+            false,
+            false,
+            SyncMode::Full,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn restore_rejects_different_disk_identity_or_capacity() {
+        let disk = TempFile::new().unwrap();
+        disk.as_file().set_len(SECTOR_SIZE).unwrap();
+        let state = test_block(&disk, "root").save_state();
+        let mut other_id = test_block(&disk, "different");
+        assert!(
+            other_id
+                .restore_state(&state)
+                .unwrap_err()
+                .contains("id differs")
+        );
+        assert_eq!(other_id.acked_features(), 0);
+
+        let other_disk = TempFile::new().unwrap();
+        other_disk.as_file().set_len(2 * SECTOR_SIZE).unwrap();
+        let mut other_capacity = test_block(&other_disk, "root");
+        assert!(
+            other_capacity
+                .restore_state(&state)
+                .unwrap_err()
+                .contains("capacity")
+        );
+        assert_eq!(other_capacity.acked_features(), 0);
+    }
+
+    #[test]
+    fn quiesce_drains_available_write_and_rearm_services_next_request() {
+        let disk = TempFile::new().unwrap();
+        disk.as_file().set_len(2 * SECTOR_SIZE).unwrap();
+        let mut block = test_block(&disk, "root");
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let ring = VirtQueue::new(GuestAddress(0x1000), &mem, 16);
+        ring.dtable[0].set(0x8000, 16, 1, 1);
+        ring.dtable[1].set(0x8100, SECTOR_SIZE as u32, 1, 2);
+        ring.dtable[2].set(0x8300, 1, 2, 0);
+        let mut header = [0u8; 16];
+        header[..4].copy_from_slice(&(VIRTIO_BLK_T_OUT as u32).to_le_bytes());
+        mem.write(&header, GuestAddress(0x8000)).unwrap();
+        mem.write(&[0x5a; SECTOR_SIZE as usize], GuestAddress(0x8100))
+            .unwrap();
+        ring.avail.ring[0].set(0);
+        ring.avail.idx.set(1);
+
+        let event = Arc::new(EventFd::new(EFD_NONBLOCK).unwrap());
+        let irq = InterruptTransport::new(DummyIrqChip::new().into(), "test-block".into()).unwrap();
+        block
+            .activate(
+                mem.clone(),
+                irq,
+                vec![DeviceQueue::new(ring.create_queue(), event.clone())],
+            )
+            .unwrap();
+        // No queue kick: only the checkpoint stop/drain can complete this write.
+        block.quiesce_for_snapshot();
+        assert!(block.snapshot_error().is_none());
+        assert_eq!(ring.used.idx.get(), 1);
+        assert_eq!(block.save_state().queue.unwrap().next_used, 1);
+        let mut on_disk = [0u8; SECTOR_SIZE as usize];
+        disk.as_file().read_exact_at(&mut on_disk, 0).unwrap();
+        assert_eq!(on_disk, [0x5a; SECTOR_SIZE as usize]);
+
+        header[8..16].copy_from_slice(&1u64.to_le_bytes());
+        mem.write(&header, GuestAddress(0x8000)).unwrap();
+        mem.write(&[0x33; SECTOR_SIZE as usize], GuestAddress(0x8100))
+            .unwrap();
+        ring.avail.ring[1].set(0);
+        ring.avail.idx.set(2);
+        block.rearm_after_snapshot();
+        event.write(1).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while ring.used.idx.get() != 2 && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert_eq!(ring.used.idx.get(), 2);
+        block.quiesce_for_snapshot();
+        disk.as_file()
+            .read_exact_at(&mut on_disk, SECTOR_SIZE)
+            .unwrap();
+        assert_eq!(on_disk, [0x33; SECTOR_SIZE as usize]);
+    }
 
     #[test]
     fn disk_image_id_prefers_supplied_block_id() {
