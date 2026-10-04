@@ -460,6 +460,21 @@ typedef KrunResult (*krun_vmm_handle_resume_fn)(KrunVmmHandle handle, KrunError*
  */
 KrunResult krun_vmm_handle_shutdown(KrunVmmHandle handle, KrunError* err_out);
 typedef KrunResult (*krun_vmm_handle_shutdown_fn)(KrunVmmHandle handle, KrunError* err_out);
+/**
+ * Save the running VM to `dir`, which must not exist (its parent must):
+ * the guest's RAM to `memory.bin`, the rest to `checkpoint.bin`, written
+ * last, every file fsync'd. On success the VM is left paused with its
+ * devices' I/O stopped, so the caller can copy its disks at this exact
+ * point, then [`resume`](Self::resume) it (which restarts the devices) or
+ * end the VMM. On failure the VM is back as it was and `dir` doesn't
+ * exist.
+ *
+ * Takes as long as writing the guest's RAM out does. Linux KVM on x86_64
+ * only (see [`checkpoint_supported`]); elsewhere it returns
+ * [`VmmError::FeatureDisabled`].
+ */
+KrunResult krun_vmm_handle_save(KrunVmmHandle handle, KrunStr dir, KrunError* err_out);
+typedef KrunResult (*krun_vmm_handle_save_fn)(KrunVmmHandle handle, KrunStr dir, KrunError* err_out);
 void krun_vmm_handle_destroy(KrunVmmHandle handle);
 typedef void (*krun_vmm_handle_destroy_fn)(KrunVmmHandle handle);
 
@@ -687,6 +702,12 @@ KrunResult krun_init_log(int target, uint32_t level, uint32_t style, uint32_t op
 typedef KrunResult (*krun_init_log_fn)(int target, uint32_t level, uint32_t style, uint32_t options, KrunError* err_out);
 bool krun_check_nested_virt(void);
 typedef bool (*krun_check_nested_virt_fn)(void);
+/**
+ * Whether this build, on this host, can save VMs ([`VmmHandle::save`]):
+ * Linux KVM on x86_64 for now.
+ */
+bool krun_checkpoint_supported(void);
+typedef bool (*krun_checkpoint_supported_fn)(void);
 KrunStr krun_result_name(KrunResult r);
 typedef KrunStr (*krun_result_name_fn)(KrunResult r);
 const char* krun_result_name_cstr(KrunResult r);

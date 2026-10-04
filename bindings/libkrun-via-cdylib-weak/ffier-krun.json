@@ -1615,6 +1615,38 @@
             "c_convention": "out_param"
           },
           "ffi_name": "krun_vmm_handle_shutdown"
+        },
+        {
+          "name": "save",
+          "doc": [
+            " Save the running VM to `dir`, which must not exist (its parent must):",
+            " the guest's RAM to `memory.bin`, the rest to `checkpoint.bin`, written",
+            " last, every file fsync'd. On success the VM is left paused with its",
+            " devices' I/O stopped, so the caller can copy its disks at this exact",
+            " point, then [`resume`](Self::resume) it (which restarts the devices) or",
+            " end the VMM. On failure the VM is back as it was and `dir` doesn't",
+            " exist.",
+            "",
+            " Takes as long as writing the guest's RAM out does. Linux KVM on x86_64",
+            " only (see [`checkpoint_supported`]); elsewhere it returns",
+            " [`VmmError::FeatureDisabled`]."
+          ],
+          "receiver": "ref",
+          "params": [
+            {
+              "name": "dir",
+              "param_kind": "regular",
+              "type": "str",
+              "ref_kind": "shared"
+            }
+          ],
+          "ret": {
+            "return_kind": "result",
+            "ok": null,
+            "err_type": "VmmError",
+            "c_convention": "out_param"
+          },
+          "ffi_name": "krun_vmm_handle_save"
         }
       ]
     },
@@ -2771,6 +2803,19 @@
     {
       "name": "check_nested_virt",
       "ffi_name": "krun_check_nested_virt",
+      "params": [],
+      "ret": {
+        "return_kind": "value",
+        "type": "bool"
+      }
+    },
+    {
+      "name": "checkpoint_supported",
+      "ffi_name": "krun_checkpoint_supported",
+      "doc": [
+        " Whether this build, on this host, can save VMs ([`VmmHandle::save`]):",
+        " Linux KVM on x86_64 for now."
+      ],
       "params": [],
       "ret": {
         "return_kind": "value",

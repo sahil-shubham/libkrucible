@@ -28,6 +28,8 @@ pub mod vmm_config;
 mod linux;
 #[cfg(target_os = "linux")]
 use crate::vmm::linux::vstate;
+#[cfg(checkpoint)]
+pub(crate) use vstate::checkpoint_supported;
 #[cfg(target_os = "macos")]
 mod macos;
 mod terminal;
@@ -45,6 +47,8 @@ use std::fmt::{Display, Formatter};
 use std::io;
 #[cfg(not(target_os = "windows"))]
 use std::os::unix::io::AsRawFd;
+#[cfg(checkpoint)]
+use std::path::Path;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
 #[cfg(any(target_os = "linux", target_os = "windows"))]
@@ -52,9 +56,13 @@ use std::time::Duration;
 #[cfg(target_os = "windows")]
 use utils::windows::AsRawFd;
 
+#[cfg(checkpoint)]
+use crate::vmm::checkpoint::{format::Checkpoint, memory};
 use crate::vmm::device_manager::mmio::MMIODeviceManager;
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 use crate::vmm::vstate::VcpuEvent;
+#[cfg(checkpoint)]
+use crate::vmm::vstate::VcpuState;
 use crate::vmm::vstate::{Vcpu, VcpuHandle, VcpuResponse, Vm};
 
 use arch::{ArchMemoryInfo, InitrdConfig};
@@ -178,6 +186,10 @@ pub struct Vmm {
     pub(crate) paused_clock: Option<kvm_bindings::kvm_clock_data>,
     #[cfg(target_os = "macos")]
     pub(crate) paused_at: u64,
+    /// The devices' I/O is stopped for a checkpoint (see [`Vmm::save`]);
+    /// [`Vmm::resume`] restarts it.
+    #[cfg(checkpoint)]
+    pub(crate) devices_quiesced: bool,
 }
 
 /// Out-of-band request to the running VM's event loop.
@@ -188,6 +200,12 @@ pub enum VmCtl {
     Pause(crossbeam_channel::Sender<std::result::Result<(), String>>),
     /// Resume; the outcome is sent back once every vCPU is running again.
     Resume(crossbeam_channel::Sender<std::result::Result<(), String>>),
+    /// Save the VM to a new checkpoint directory; see [`Vmm::save`].
+    #[cfg(checkpoint)]
+    Save {
+        dir: std::path::PathBuf,
+        reply: crossbeam_channel::Sender<std::result::Result<(), String>>,
+    },
 }
 
 impl Vmm {
@@ -348,9 +366,12 @@ impl Vmm {
     }
 
     /// Wake every vCPU frozen by [`Vmm::pause`], with the guest's clocks
-    /// continuing from where they stopped. Idempotent.
+    /// continuing from where they stopped, after restarting the device I/O a
+    /// checkpoint stopped. Idempotent.
     #[cfg(target_os = "linux")]
     pub fn resume(&mut self) -> std::result::Result<(), String> {
+        #[cfg(checkpoint)]
+        self.rearm_devices();
         if !self.paused {
             return Ok(());
         }
@@ -505,6 +526,93 @@ impl Vmm {
     }
 }
 
+/// Checkpoints: saving a running VM to a directory.
+#[cfg(checkpoint)]
+impl Vmm {
+    /// Saves the VM to `dir`, which must not exist yet (its parent must). On
+    /// success the VM is left paused with its device I/O stopped, so the
+    /// caller can copy its disks at the instant the checkpoint captured;
+    /// [`Vmm::resume`] runs it on. On failure the VM is back as it was and
+    /// `dir` doesn't exist.
+    pub fn save(&mut self, dir: &Path) -> std::result::Result<(), String> {
+        if let Some(why) = self.mmio_device_manager.checkpoint_refusal() {
+            return Err(format!("can't checkpoint this VM: {why}"));
+        }
+        let (was_paused, was_quiesced) = (self.paused, self.devices_quiesced);
+        self.pause()?;
+        let saved = self.save_paused(dir);
+        if let Err(e) = &saved {
+            if !was_quiesced {
+                self.rearm_devices();
+            }
+            if !was_paused {
+                self.resume()
+                    .map_err(|r| format!("{e}; then resuming the VM failed: {r}"))?;
+            }
+        }
+        saved
+    }
+
+    fn save_paused(&mut self, dir: &Path) -> std::result::Result<(), String> {
+        self.devices_quiesced = true;
+        self.mmio_device_manager.quiesce_devices()?;
+        let vcpus = self.save_vcpu_states()?;
+        let vm = self.vm.save_state().map_err(|e| e.to_string())?;
+        let device_state = self.mmio_device_manager.snapshot_devices()?.to_bytes()?;
+        Checkpoint {
+            ram: memory::layout(&self.guest_memory),
+            devices: self.mmio_device_manager.device_ids(),
+            vm,
+            vcpus,
+            device_state,
+        }
+        .save(dir, &self.guest_memory)
+    }
+
+    fn rearm_devices(&mut self) {
+        if std::mem::take(&mut self.devices_quiesced) {
+            self.mmio_device_manager.rearm_devices();
+        }
+    }
+
+    /// The state of every vCPU; they must be paused.
+    fn save_vcpu_states(&self) -> std::result::Result<Vec<VcpuState>, String> {
+        let events = self
+            .vcpus_handles
+            .iter()
+            .map(|_| VcpuEvent::SaveState)
+            .collect();
+        self.ask_vcpus(events)
+            .into_iter()
+            .enumerate()
+            .map(|(i, answer)| match answer {
+                Ok(VcpuResponse::SavedState(state)) => Ok(*state),
+                Ok(VcpuResponse::SaveFailed(e)) => Err(format!("vCPU {i}: {e}")),
+                Ok(other) => Err(format!("vCPU {i}: unexpected response {other:?}")),
+                Err(e) => Err(format!("vCPU {i}: {e}")),
+            })
+            .collect()
+    }
+
+    /// Hands the first vCPUs one event each and collects every answer, even
+    /// after a failure, so that none is left behind for a later request. The
+    /// vCPUs must be paused: their paused loop answers.
+    fn ask_vcpus(&self, events: Vec<VcpuEvent>) -> Vec<std::result::Result<VcpuResponse, String>> {
+        let asked = &self.vcpus_handles[..events.len().min(self.vcpus_handles.len())];
+        for (h, event) in asked.iter().zip(events) {
+            // The kick only matters to a running vCPU: a paused one reads the
+            // event anyway, and its answer is collected below.
+            if let Err(e) = h.send_event(event) {
+                warn!("vcpu kick: {e}");
+            }
+        }
+        asked
+            .iter()
+            .map(|h| h.response_receiver().recv().map_err(|e| e.to_string()))
+            .collect()
+    }
+}
+
 impl Subscriber for Vmm {
     /// Handle a read event (EPOLLIN).
     fn process(&mut self, event: &EpollEvent, _: &mut EventManager) {
@@ -517,6 +625,8 @@ impl Subscriber for Vmm {
                 let (op, res, reply) = match req {
                     VmCtl::Pause(reply) => ("pause", self.pause(), reply),
                     VmCtl::Resume(reply) => ("resume", self.resume(), reply),
+                    #[cfg(checkpoint)]
+                    VmCtl::Save { dir, reply } => ("save", self.save(&dir), reply),
                 };
                 if let Err(e) = &res {
                     error!("vm {op} failed: {e}");

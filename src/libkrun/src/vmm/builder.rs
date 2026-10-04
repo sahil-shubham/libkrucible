@@ -1253,6 +1253,8 @@ pub fn build_microvm(
         paused_clock: None,
         #[cfg(target_os = "macos")]
         paused_at: 0,
+        #[cfg(checkpoint)]
+        devices_quiesced: false,
     };
 
     // Set raw mode for FDs that are connected to legacy serial devices.

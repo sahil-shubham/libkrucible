@@ -1,6 +1,8 @@
 use std::marker::PhantomData;
 #[cfg(not(target_os = "windows"))]
 use std::os::fd::{AsRawFd, BorrowedFd};
+#[cfg(checkpoint)]
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -252,6 +254,42 @@ impl VmmHandle {
         #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
         Err(VmmError::FeatureDisabled())
     }
+
+    /// Save the running VM to `dir`, which must not exist (its parent must):
+    /// the guest's RAM to `memory.bin`, the rest to `checkpoint.bin`, written
+    /// last, every file fsync'd. On success the VM is left paused with its
+    /// devices' I/O stopped, so the caller can copy its disks at this exact
+    /// point, then [`resume`](Self::resume) it (which restarts the devices) or
+    /// end the VMM. On failure the VM is back as it was and `dir` doesn't
+    /// exist.
+    ///
+    /// Takes as long as writing the guest's RAM out does. Linux KVM on x86_64
+    /// only (see [`checkpoint_supported`]); elsewhere it returns
+    /// [`VmmError::FeatureDisabled`].
+    pub fn save(&self, dir: &str) -> Result<(), VmmError> {
+        #[cfg(checkpoint)]
+        {
+            let (reply, answer) = crossbeam_channel::bounded(1);
+            self.vm_ctl_tx
+                .send(VmCtl::Save {
+                    dir: PathBuf::from(dir),
+                    reply,
+                })
+                .map_err(|e| VmmError::Internal(format!("save: {e}")))?;
+            // No deadline: giving up early would report a failure while the
+            // save carries on and leaves the VM paused. The channel closes if
+            // the VMM goes away.
+            match answer.recv() {
+                Ok(result) => result.map_err(|e| VmmError::Internal(format!("save: {e}"))),
+                Err(_) => Err(VmmError::Internal("save: the VMM is gone".into())),
+            }
+        }
+        #[cfg(not(checkpoint))]
+        {
+            let _ = dir;
+            Err(VmmError::FeatureDisabled())
+        }
+    }
 }
 
 #[cfg_attr(feature = "ffi", ffier::export)]
@@ -325,6 +363,20 @@ pub fn check_nested_virt() -> bool {
         })
     }
     #[cfg(target_os = "windows")]
+    {
+        false
+    }
+}
+
+/// Whether this build, on this host, can save VMs ([`VmmHandle::save`]):
+/// Linux KVM on x86_64 for now.
+#[cfg_attr(feature = "ffi", ffier::export)]
+pub fn checkpoint_supported() -> bool {
+    #[cfg(checkpoint)]
+    {
+        crate::vmm::checkpoint_supported()
+    }
+    #[cfg(not(checkpoint))]
     {
         false
     }

@@ -515,6 +515,15 @@ impl KvmContext {
     }
 }
 
+/// Whether this host's KVM can restore a checkpoint: carrying the guest's
+/// clock across the gap needs KVM_SET_CLOCK to take KVM_CLOCK_REALTIME
+/// (Linux 5.16+).
+#[cfg(checkpoint)]
+pub fn checkpoint_supported() -> bool {
+    Kvm::new()
+        .is_ok_and(|kvm| kvm.check_extension_int(AdjustClock) as u32 & KVM_CLOCK_REALTIME != 0)
+}
+
 /// A wrapper around creating and using a VM.
 pub struct Vm {
     fd: VmFd,
