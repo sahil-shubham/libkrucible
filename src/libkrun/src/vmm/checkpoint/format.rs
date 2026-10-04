@@ -8,10 +8,11 @@
 //! `checkpoint.bin` starts with a fixed header that anything can check
 //! without parsing the rest (all little-endian): the 8-byte magic
 //! `KRUNCKPT`, then u32 format version, u32 architecture, u32 hypervisor. The
-//! body is the RAM layout, the vCPU count, the device list and the VM, vCPU
-//! and device state. A checkpoint is only read back by the build that
-//! wrote it on the host that wrote it (the version is bumped whenever the
-//! body changes); other files in the directory are ignored.
+//! host record (see [`super::compat`]) follows as a length-prefixed section,
+//! then the body: the RAM layout, the vCPU count, the device list and the VM,
+//! vCPU and device state. A checkpoint is only read back by a build of the same
+//! format version (bumped whenever the record or the body changes), on a host
+//! its record admits; other files in the directory are ignored.
 
 use std::fs::{File, OpenOptions};
 use std::io::Write;
@@ -20,6 +21,7 @@ use std::path::Path;
 use vm_memory::GuestMemoryMmap;
 
 use super::codec::{Decoder, Encoder};
+use super::compat::HostRecord;
 use super::memory::{self, RamRegion};
 use crate::vmm::vstate::{VcpuState, VmState};
 
@@ -27,7 +29,7 @@ pub(crate) const CHECKPOINT_FILE: &str = "checkpoint.bin";
 pub(crate) const MEMORY_FILE: &str = "memory.bin";
 
 const MAGIC: &[u8; 8] = b"KRUNCKPT";
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 
 // Header platform codes.
 const ARCH_X86_64: u32 = 1;
@@ -66,6 +68,8 @@ impl std::fmt::Display for DeviceId {
 
 /// Everything a checkpoint holds besides the RAM contents.
 pub(crate) struct Checkpoint {
+    /// The host the checkpoint was taken on and what it gave the guest.
+    pub host: HostRecord,
     pub ram: Vec<RamRegion>,
     pub devices: Vec<DeviceId>,
     pub vm: VmState,
@@ -81,6 +85,9 @@ impl Checkpoint {
         enc.u32(VERSION);
         enc.u32(HOST.0);
         enc.u32(HOST.1);
+        let mut host = Encoder::new();
+        self.host.encode(&mut host);
+        enc.bytes(&host.into_bytes());
         enc.u32(self.ram.len() as u32);
         for r in &self.ram {
             enc.u64(r.gpa);
@@ -123,6 +130,7 @@ impl Checkpoint {
                 platform_name(HOST)
             ));
         }
+        let host = section(dec.bytes()?, HostRecord::decode)?;
         let ram = (0..dec.u32()?)
             .map(|_| {
                 Ok(RamRegion {
@@ -146,6 +154,7 @@ impl Checkpoint {
         let device_state = dec.bytes()?.to_vec();
         dec.finish()?;
         Ok(Checkpoint {
+            host,
             ram,
             devices,
             vm,
@@ -207,18 +216,8 @@ impl Checkpoint {
             .map_err(|e| format!("sync {}: {e}", dir.display()))
     }
 
-    /// Reads the checkpoint in `dir` and opens its RAM image (read-only: a
-    /// restore never writes the checkpoint).
-    pub(crate) fn load(dir: &Path) -> Result<(Self, File), String> {
-        let open = |name: &str| {
-            File::open(dir.join(name)).map_err(|e| match e.kind() {
-                std::io::ErrorKind::NotFound => format!(
-                    "incomplete checkpoint: {} has no {name} (an unfinished or failed save?)",
-                    dir.display()
-                ),
-                _ => format!("open {name}: {e}"),
-            })
-        };
+    /// Reads and decodes the checkpoint in `dir`, without its RAM image.
+    pub(crate) fn read(dir: &Path) -> Result<Self, String> {
         let buf = std::fs::read(dir.join(CHECKPOINT_FILE)).map_err(|e| match e.kind() {
             std::io::ErrorKind::NotFound => format!(
                 "incomplete checkpoint: {} has no {CHECKPOINT_FILE} (an unfinished or failed save?)",
@@ -226,8 +225,20 @@ impl Checkpoint {
             ),
             _ => format!("read {CHECKPOINT_FILE}: {e}"),
         })?;
-        let checkpoint = Self::decode(&buf).map_err(|e| format!("{CHECKPOINT_FILE}: {e}"))?;
-        let memory = open(MEMORY_FILE)?;
+        Self::decode(&buf).map_err(|e| format!("{CHECKPOINT_FILE}: {e}"))
+    }
+
+    /// Reads the checkpoint in `dir` and opens its RAM image (read-only: a
+    /// restore never writes the checkpoint).
+    pub(crate) fn load(dir: &Path) -> Result<(Self, File), String> {
+        let checkpoint = Self::read(dir)?;
+        let memory = File::open(dir.join(MEMORY_FILE)).map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => format!(
+                "incomplete checkpoint: {} has no {MEMORY_FILE} (an unfinished or failed save?)",
+                dir.display()
+            ),
+            _ => format!("open {MEMORY_FILE}: {e}"),
+        })?;
         let len = memory
             .metadata()
             .map_err(|e| format!("stat {MEMORY_FILE}: {e}"))?
@@ -285,6 +296,7 @@ fn section<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vmm::checkpoint::compat::CAP_CLOCK_REALTIME;
     use crate::vmm::vstate::sample_states;
     use std::path::PathBuf;
     use vm_memory::{Bytes, GuestAddress};
@@ -297,6 +309,7 @@ mod tests {
         mem.write_slice(b"ram", GuestAddress(0x1000)).unwrap();
         let (vm, vcpus) = sample_states(2);
         let checkpoint = Checkpoint {
+            host: HostRecord::here(&[], 3_600_000, CAP_CLOCK_REALTIME, vec![0x10, 0x174]),
             ram: memory::layout(&mem),
             devices: vec![
                 DeviceId {
@@ -337,6 +350,14 @@ mod tests {
         // Re-encoding gives the same bytes: every section round-tripped.
         assert_eq!(loaded.encode(), encoded);
         assert_eq!(memory.metadata().unwrap().len(), 0x6000);
+    }
+
+    #[test]
+    fn read_takes_only_the_checkpoint_file() {
+        let (_tmp, dir, encoded) = saved();
+        std::fs::remove_file(dir.join(MEMORY_FILE)).unwrap();
+        assert_eq!(Checkpoint::read(&dir).unwrap().encode(), encoded);
+        assert!(Checkpoint::load(&dir).is_err());
     }
 
     #[test]
@@ -386,8 +407,13 @@ mod tests {
                 Box::new(|d: &PathBuf| std::fs::write(d.join(CHECKPOINT_FILE), b"KRUNCKP").unwrap()),
             ),
             (
-                "unsupported checkpoint version 2",
-                Box::new(move |d: &PathBuf| patch(d, 8, 2)),
+                "unsupported checkpoint version 3",
+                Box::new(move |d: &PathBuf| patch(d, 8, 3)),
+            ),
+            // Written before checkpoints carried a host record.
+            (
+                "unsupported checkpoint version 1",
+                Box::new(move |d: &PathBuf| patch(d, 8, 1)),
             ),
             (
                 "checkpoint was taken on aarch64/KVM; this host is x86_64/KVM",

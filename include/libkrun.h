@@ -185,6 +185,7 @@ typedef void (*krun_free_object_array_fn)(KrunObjectArray a);
 #define KRUN_ERROR_VMM_FEATURE_DISABLED ((uint64_t)16777217 << 32 | 7)
 #define KRUN_ERROR_VMM_BOOT_ERROR ((uint64_t)16777217 << 32 | 8)
 #define KRUN_ERROR_VMM_INTERNAL ((uint64_t)16777217 << 32 | 9)
+#define KRUN_ERROR_VMM_CHECKPOINT ((uint64_t)16777217 << 32 | 10)
 
 /* MmioDeviceManager ------------------------------------------------- */
 
@@ -427,11 +428,11 @@ typedef void (*krun_vmm_builder_shutdown_support_fn)(KrunVmmBuilder* handle, boo
  * Restore the VM from a checkpoint directory instead of booting:
  * [`build`](Self::build) maps the checkpoint's `memory.bin` privately
  * (the directory is never modified, so it can be restored any number of
- * times), checks the checkpoint against this builder's vCPUs, RAM and
- * devices, and the VM resumes where [`VmmHandle::save`] froze it. The
- * payload and every device must be configured as for the saved VM (same
- * types, ids and order); their host-side resources (socket paths, disk
- * files) are new.
+ * times), checks the checkpoint against this host (see
+ * [`checkpoint_check_host`]) and this builder's vCPUs, RAM and devices,
+ * and the VM resumes where [`VmmHandle::save`] froze it. The payload and
+ * every device must be configured as for the saved VM (same types, ids and
+ * order); their host-side resources (socket paths, disk files) are new.
  */
 void krun_vmm_builder_restore_from(KrunVmmBuilder* handle, KrunStr dir);
 typedef void (*krun_vmm_builder_restore_from_fn)(KrunVmmBuilder* handle, KrunStr dir);
@@ -721,6 +722,19 @@ typedef bool (*krun_check_nested_virt_fn)(void);
  */
 bool krun_checkpoint_supported(void);
 typedef bool (*krun_checkpoint_supported_fn)(void);
+/**
+ * Whether this host can restore the checkpoint in `dir`, without building a
+ * VM: the error carries the reason [`VmmBuilder::restore_from`] would refuse
+ * it here. A checkpoint records the host it was taken on; another CPU vendor
+ * or page size, CPU features or MSRs the guest uses that this host lacks, or a
+ * TSC rate this host can't run the guest at refuse it, as does a damaged or
+ * foreign `checkpoint.bin`. The RAM image isn't read.
+ *
+ * Linux KVM on x86_64 only (see [`checkpoint_supported`]); elsewhere it
+ * returns [`VmmError::FeatureDisabled`].
+ */
+KrunResult krun_checkpoint_check_host(KrunStr dir, KrunError* err_out);
+typedef KrunResult (*krun_checkpoint_check_host_fn)(KrunStr dir, KrunError* err_out);
 KrunStr krun_result_name(KrunResult r);
 typedef KrunStr (*krun_result_name_fn)(KrunResult r);
 const char* krun_result_name_cstr(KrunResult r);

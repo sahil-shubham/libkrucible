@@ -52,7 +52,9 @@ pub use devices::virtio::block::{DiskFormat, SyncMode};
 pub use error::VmmError;
 pub use logging::{LogLevel, LogOptions, LogStyle, init_log};
 pub use payload::{KernelFormat, Payload};
-pub use vmm_builder::{Vmm, VmmBuilder, VmmHandle, check_nested_virt, checkpoint_supported};
+pub use vmm_builder::{
+    Vmm, VmmBuilder, VmmHandle, check_nested_virt, checkpoint_check_host, checkpoint_supported,
+};
 
 #[cfg(feature = "net")]
 pub use devices::virtio::net::device::VirtioNetBackend;
@@ -126,6 +128,7 @@ ffier::library_definition!("krun", library_tag = 1,
     fn crate::api::logging::init_log,
     fn crate::api::vmm_builder::check_nested_virt,
     fn crate::api::vmm_builder::checkpoint_supported,
+    fn crate::api::vmm_builder::checkpoint_check_host,
     bitflags crate::api::logging::LogOptions,
     bitflags crate::api::device_builders::TsiFlags,
     #[cfg(feature = "gpu")]

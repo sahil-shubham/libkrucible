@@ -37,4 +37,10 @@ pub enum VmmError {
     #[error("internal error: {0}")]
     #[cfg_attr(feature = "ffi", ffier(code = 9, opaque))]
     Internal(String),
+
+    /// A checkpoint that can't be restored here: damaged, foreign, or saved on
+    /// a host this one can't stand in for.
+    #[error("checkpoint: {0}")]
+    #[cfg_attr(feature = "ffi", ffier(code = 10, opaque))]
+    Checkpoint(String),
 }

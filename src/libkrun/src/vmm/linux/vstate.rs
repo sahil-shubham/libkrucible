@@ -43,6 +43,10 @@ use kbs_types::Tee;
 use crate::vmm::resources::TeeConfig;
 #[cfg(checkpoint)]
 use crate::vmm::checkpoint::codec::{Decoder, Encoder, Pod};
+#[cfg(checkpoint)]
+use crate::vmm::checkpoint::compat::{
+    CAP_CLOCK_REALTIME, CAP_TSC_OFFSET, CAP_TSC_SCALING, HostRecord,
+};
 use crate::vmm::vmm_config::machine_config::CpuFeaturesTemplate;
 #[cfg(target_arch = "x86_64")]
 use cpuid::{VmSpec, c3, filter_cpuid, t2};
@@ -1015,6 +1019,85 @@ impl Vm {
         }
         Ok(())
     }
+
+    #[cfg(checkpoint)]
+    /// The host record a checkpoint of this VM carries: this host's CPU, what
+    /// the guest was given (`vcpu0` as saved; every vCPU gets the same CPUID
+    /// and TSC rate) and the KVM capabilities its state depends on.
+    pub fn host_record(&self, vcpu0: &VcpuState) -> HostRecord {
+        // save_state anchors every saved kvmclock to wall-clock time.
+        let mut caps = CAP_CLOCK_REALTIME;
+        if vcpu0.tsc.offset.is_some() {
+            caps |= CAP_TSC_OFFSET;
+        }
+        if self.fd.check_extension(TscControl) {
+            caps |= CAP_TSC_SCALING;
+        }
+        let msrs = vcpu0.msrs.as_slice().iter().map(|e| e.index).collect();
+        HostRecord::here(vcpu0.cpuid.as_slice(), vcpu0.tsc.khz, caps, msrs)
+    }
+
+    #[cfg(checkpoint)]
+    /// This host as a restore into this VM meets a checkpoint: the CPUID
+    /// `vcpu` (configured, not yet restored) gives a guest, the TSC rate it
+    /// runs at before a restore sets one, the KVM capabilities a restore uses
+    /// and the MSRs KVM can restore.
+    pub fn restore_host_record(&self, vcpu: &Vcpu) -> Result<HostRecord> {
+        host_offer(
+            &self.fd,
+            &vcpu.fd,
+            vcpu.cpuid.as_slice(),
+            &self.supported_msrs,
+        )
+    }
+}
+
+/// What this host offers a restored guest, given the VM and a vCPU created
+/// for it and the CPUID configured for that vCPU.
+#[cfg(checkpoint)]
+fn host_offer(
+    vm: &VmFd,
+    vcpu: &VcpuFd,
+    guest_cpuid: &[kvm_cpuid_entry2],
+    msrs: &MsrList,
+) -> Result<HostRecord> {
+    let mut caps = 0;
+    if vm.check_extension_int(AdjustClock) as u32 & KVM_CLOCK_REALTIME != 0 {
+        caps |= CAP_CLOCK_REALTIME;
+    }
+    // SAFETY: the attribute struct is valid for the call; HAS only checks
+    // that the attribute exists and never touches `addr`.
+    if unsafe { ioctl_with_ref(vcpu, KVM_HAS_DEVICE_ATTR(), &tsc_offset_attr(0)) } == 0 {
+        caps |= CAP_TSC_OFFSET;
+    }
+    if vm.check_extension(TscControl) {
+        caps |= CAP_TSC_SCALING;
+    }
+    let khz = vcpu.get_tsc_khz().map_err(Error::VcpuTscKhz)?;
+    Ok(HostRecord::here(
+        guest_cpuid,
+        khz,
+        caps,
+        msrs.as_slice().to_vec(),
+    ))
+}
+
+/// This host's record for restoring a checkpoint with `vcpu_count` vCPUs,
+/// taken from a throwaway VM without building one for the guest: what
+/// [`Vm::restore_host_record`] gives for the VM a restore builds.
+#[cfg(checkpoint)]
+pub fn probe_host(vcpu_count: u8) -> Result<HostRecord> {
+    let kvm = Kvm::new().map_err(Error::VmFd)?;
+    let vm = kvm.create_vm().map_err(Error::VmFd)?;
+    let vcpu = vm.create_vcpu(0).map_err(Error::VcpuFd)?;
+    let mut cpuid = kvm
+        .get_supported_cpuid(KVM_MAX_CPUID_ENTRIES)
+        .map_err(Error::VmFd)?;
+    // As Vcpu::configure_x86_64 sets up a vCPU of the VM a restore builds.
+    let spec = VmSpec::new(0, vcpu_count, false, false).map_err(Error::CpuId)?;
+    filter_cpuid(&mut cpuid, &spec).map_err(Error::CpuId)?;
+    let msrs = arch::x86_64::msr::supported_guest_msrs(&kvm).map_err(Error::GuestMSRs)?;
+    host_offer(&vm, &vcpu, cpuid.as_slice(), &msrs)
 }
 
 #[cfg(checkpoint)]
@@ -2831,5 +2914,36 @@ mod tests {
         assert_eq!(midpoint(100, 300).unwrap(), 200);
         assert!(midpoint(300, 100).is_err(), "wall clock stepped back");
         assert!(midpoint(0, 1_000_000_000).is_err(), "a 1 s window");
+    }
+
+    /// The import-time check (`probe_host`, a throwaway VM) and the restore
+    /// (the VM it builds) must judge a checkpoint alike: one may not admit
+    /// what the other refuses.
+    #[cfg(checkpoint)]
+    #[test]
+    fn the_host_probe_matches_the_vm_a_restore_builds() {
+        let (vm, vcpu, _mem, _) = distinctive_vcpu();
+        let restore = vm.restore_host_record(&vcpu).unwrap();
+        assert_eq!(probe_host(1).unwrap(), restore);
+        assert!(!restore.cpuid.is_empty() && !restore.msrs.is_empty());
+        assert!(restore.kvm_caps & CAP_CLOCK_REALTIME != 0, "{restore:?}");
+    }
+
+    #[cfg(checkpoint)]
+    #[test]
+    fn a_checkpoint_passes_on_the_host_that_took_it() {
+        let (vm, vcpu, _mem, _) = distinctive_vcpu();
+        let saved = vm.host_record(&vcpu.save_state().unwrap());
+        assert_eq!(saved.cpuid, probe_host(1).unwrap().cpuid);
+        saved.check(&probe_host(1).unwrap()).unwrap();
+
+        // The same guest saved on a CPU with a feature this one lacks.
+        let mut foreign = saved.clone();
+        let absent = (0..32)
+            .find(|bit| saved.cpuid[0].bits & (1 << bit) == 0)
+            .unwrap();
+        foreign.cpuid[0].bits |= 1 << absent;
+        let err = foreign.check(&probe_host(1).unwrap()).unwrap_err();
+        assert!(err.contains("lacks features the guest uses"), "{err}");
     }
 }

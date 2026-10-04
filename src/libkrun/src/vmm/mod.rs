@@ -30,6 +30,19 @@ mod linux;
 use crate::vmm::linux::vstate;
 #[cfg(checkpoint)]
 pub(crate) use vstate::checkpoint_supported;
+
+/// Whether this host can restore the checkpoint in `dir`, from its
+/// `checkpoint.bin` alone (the RAM image isn't read), without building a VM
+/// for it: the reason a restore here would refuse it, if so.
+#[cfg(checkpoint)]
+pub(crate) fn check_checkpoint_host(dir: &Path) -> std::result::Result<(), String> {
+    let checkpoint = Checkpoint::read(dir)?;
+    let vcpus = u8::try_from(checkpoint.vcpus.len())
+        .map_err(|_| format!("{} vCPUs is more than a VM has", checkpoint.vcpus.len()))?;
+    let here = vstate::probe_host(vcpus).map_err(|e| format!("probe this host: {e}"))?;
+    checkpoint.host.check(&here)
+}
+
 #[cfg(target_os = "macos")]
 mod macos;
 mod terminal;
@@ -575,8 +588,12 @@ impl Vmm {
         self.mmio_device_manager.quiesce_devices()?;
         let vcpus = self.save_vcpu_states()?;
         let vm = self.vm.save_state().map_err(|e| e.to_string())?;
+        let host = self
+            .vm
+            .host_record(vcpus.first().ok_or("the VM has no vCPUs")?);
         let device_state = self.mmio_device_manager.snapshot_devices()?.to_bytes()?;
         Checkpoint {
+            host,
             ram: memory::layout(&self.guest_memory),
             devices: self.mmio_device_manager.device_ids(),
             vm,

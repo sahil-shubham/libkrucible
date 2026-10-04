@@ -143,11 +143,11 @@ impl<'a> VmmBuilder<'a> {
     /// Restore the VM from a checkpoint directory instead of booting:
     /// [`build`](Self::build) maps the checkpoint's `memory.bin` privately
     /// (the directory is never modified, so it can be restored any number of
-    /// times), checks the checkpoint against this builder's vCPUs, RAM and
-    /// devices, and the VM resumes where [`VmmHandle::save`] froze it. The
-    /// payload and every device must be configured as for the saved VM (same
-    /// types, ids and order); their host-side resources (socket paths, disk
-    /// files) are new.
+    /// times), checks the checkpoint against this host (see
+    /// [`checkpoint_check_host`]) and this builder's vCPUs, RAM and devices,
+    /// and the VM resumes where [`VmmHandle::save`] froze it. The payload and
+    /// every device must be configured as for the saved VM (same types, ids and
+    /// order); their host-side resources (socket paths, disk files) are new.
     pub fn restore_from(mut self, dir: &str) -> Self {
         self.restore_from = Some(PathBuf::from(dir));
         self
@@ -393,6 +393,28 @@ pub fn checkpoint_supported() -> bool {
     #[cfg(not(checkpoint))]
     {
         false
+    }
+}
+
+/// Whether this host can restore the checkpoint in `dir`, without building a
+/// VM: the error carries the reason [`VmmBuilder::restore_from`] would refuse
+/// it here. A checkpoint records the host it was taken on; another CPU vendor
+/// or page size, CPU features or MSRs the guest uses that this host lacks, or a
+/// TSC rate this host can't run the guest at refuse it, as does a damaged or
+/// foreign `checkpoint.bin`. The RAM image isn't read.
+///
+/// Linux KVM on x86_64 only (see [`checkpoint_supported`]); elsewhere it
+/// returns [`VmmError::FeatureDisabled`].
+#[cfg_attr(feature = "ffi", ffier::export)]
+pub fn checkpoint_check_host(dir: &str) -> Result<(), VmmError> {
+    #[cfg(checkpoint)]
+    {
+        crate::vmm::check_checkpoint_host(std::path::Path::new(dir)).map_err(VmmError::Checkpoint)
+    }
+    #[cfg(not(checkpoint))]
+    {
+        let _ = dir;
+        Err(VmmError::FeatureDisabled())
     }
 }
 

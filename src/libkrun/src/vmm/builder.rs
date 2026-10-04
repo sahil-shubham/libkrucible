@@ -1115,6 +1115,20 @@ pub fn build_microvm(
             _sender,
         )
         .map_err(StartMicrovmError::Internal)?;
+
+        // Before any device is attached, so that a host which can't run the
+        // guest is refused without opening its disks or network.
+        #[cfg(checkpoint)]
+        if let Some(restore) = &restore {
+            let here = vm
+                .restore_host_record(&vcpus[0])
+                .map_err(|e| StartMicrovmError::Checkpoint(format!("probe this host: {e}")))?;
+            restore
+                .checkpoint
+                .host
+                .check(&here)
+                .map_err(StartMicrovmError::Checkpoint)?;
+        }
     }
 
     #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
