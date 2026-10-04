@@ -1177,12 +1177,32 @@ pub fn build_microvm(
     // Search for `kvm_arch_vcpu_create` in arch/arm/kvm/arm.c.
     #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
     {
+        // A restore checks this host against the checkpoint's before any vCPU
+        // or device exists, so a host that can't run the guest is refused
+        // without opening its disks or network. Its vCPUs are then created as
+        // the saved ones were, not with everything this host offers.
+        #[cfg(checkpoint)]
+        let shape = match &restore {
+            Some(restore) => {
+                let here = super::vstate::probe_host(vcpu_config.vcpu_count)
+                    .map_err(|e| StartMicrovmError::Checkpoint(format!("probe this host: {e}")))?;
+                let saved = &restore.checkpoint.host;
+                saved.check(&here).map_err(StartMicrovmError::Checkpoint)?;
+                Some(crate::vmm::linux::arm64::VcpuShape {
+                    features: saved.vcpu_features,
+                    sve_vls: saved.sve_vls.clone(),
+                })
+            }
+            None => None,
+        };
         vcpus = create_vcpus_aarch64(
             &vm,
             &vcpu_config,
             &arch_memory_info,
             payload_config.entry_addr,
             &exit_evt,
+            #[cfg(checkpoint)]
+            shape.as_ref(),
         )
         .map_err(StartMicrovmError::Internal)?;
 
@@ -1201,6 +1221,11 @@ pub fn build_microvm(
             };
             Arc::new(Mutex::new(gic))
         };
+        // The vGIC's state is part of the VM's in a checkpoint.
+        #[cfg(checkpoint)]
+        vm.set_gic(&intc, vcpus.iter().map(Vcpu::get_mpidr).collect())
+            .map_err(Error::Vm)
+            .map_err(StartMicrovmError::Internal)?;
 
         attach_legacy_devices(
             &vm,
@@ -2415,6 +2440,7 @@ fn create_vcpus_aarch64(
     mem_info: &ArchMemoryInfo,
     entry_addr: GuestAddress,
     exit_evt: &EventFd,
+    #[cfg(checkpoint)] shape: Option<&crate::vmm::linux::arm64::VcpuShape>,
 ) -> super::Result<Vec<Vcpu>> {
     let mut vcpus = Vec::with_capacity(vcpu_config.vcpu_count as usize);
     for cpu_index in 0..vcpu_config.vcpu_count {
@@ -2425,8 +2451,14 @@ fn create_vcpus_aarch64(
         )
         .map_err(Error::Vcpu)?;
 
-        vcpu.configure_aarch64(vm.fd(), mem_info, entry_addr)
-            .map_err(Error::Vcpu)?;
+        vcpu.configure_aarch64(
+            vm.fd(),
+            mem_info,
+            entry_addr,
+            #[cfg(checkpoint)]
+            shape,
+        )
+        .map_err(Error::Vcpu)?;
 
         vcpus.push(vcpu);
     }
@@ -2719,6 +2751,8 @@ pub mod tests {
             &arch_memory_info,
             entry_addr,
             &EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap(),
+            #[cfg(checkpoint)]
+            None,
         )
         .unwrap();
         assert_eq!(vcpu_vec.len(), vcpu_count as usize);

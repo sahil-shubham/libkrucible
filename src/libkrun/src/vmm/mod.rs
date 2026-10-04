@@ -622,15 +622,22 @@ impl Vmm {
         let Checkpoint {
             devices,
             vm,
-            vcpus: mut vcpu_states,
+            vcpus: vcpu_states,
             device_state,
             ..
         } = checkpoint;
         let device_state = VmDevicesState::from_bytes(&device_state)?;
         self.vm.restore_state(&vm).map_err(|e| e.to_string())?;
-        self.vm
-            .rebase_vcpu_tsc(&vm, &mut vcpu_states)
-            .map_err(|e| e.to_string())?;
+        // The vCPUs' TSCs move on with the kvmclock restore_state moved on;
+        // an arm64 vCPU moves its counter on as it loads its state.
+        #[cfg(target_arch = "x86_64")]
+        let vcpu_states = {
+            let mut vcpu_states = vcpu_states;
+            self.vm
+                .rebase_vcpu_tsc(&vm, &mut vcpu_states)
+                .map_err(|e| e.to_string())?;
+            vcpu_states
+        };
         // Before the vCPU threads start, so that a VM with other devices is
         // refused without leaving any behind.
         self.mmio_device_manager

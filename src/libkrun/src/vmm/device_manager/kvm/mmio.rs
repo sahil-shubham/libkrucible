@@ -98,6 +98,11 @@ pub struct MMIODeviceManager {
     /// KVM, where a checkpoint reads the interrupt controllers from.
     #[cfg(checkpoint)]
     userspace_ioapic: bool,
+    /// arm64's RTC and UARTs: a checkpoint holds their state too.
+    #[cfg(all(checkpoint, target_arch = "aarch64"))]
+    rtc: Option<Arc<Mutex<devices::legacy::RTC>>>,
+    #[cfg(all(checkpoint, target_arch = "aarch64"))]
+    serials: Vec<Arc<Mutex<devices::legacy::Serial>>>,
 }
 
 #[cfg(checkpoint)]
@@ -123,6 +128,10 @@ impl MMIODeviceManager {
             virtio_devices: Vec::new(),
             #[cfg(checkpoint)]
             userspace_ioapic: false,
+            #[cfg(all(checkpoint, target_arch = "aarch64"))]
+            rtc: None,
+            #[cfg(all(checkpoint, target_arch = "aarch64"))]
+            serials: Vec::new(),
         }
     }
 
@@ -248,6 +257,8 @@ impl MMIODeviceManager {
             serial.set_irq_line(self.irq);
         }
 
+        #[cfg(all(checkpoint, target_arch = "aarch64"))]
+        self.serials.push(serial.clone());
         self.bus
             .insert(serial, self.mmio_base, MMIO_LEN)
             .map_err(Error::BusError)?;
@@ -291,8 +302,13 @@ impl MMIODeviceManager {
         vm.register_irqfd(&rtc_evt, self.irq)
             .map_err(Error::RegisterIrqFd)?;
 
+        let device = Arc::new(Mutex::new(device));
+        #[cfg(all(checkpoint, target_arch = "aarch64"))]
+        {
+            self.rtc = Some(device.clone());
+        }
         self.bus
-            .insert(Arc::new(Mutex::new(device)), self.mmio_base, MMIO_LEN)
+            .insert(device, self.mmio_base, MMIO_LEN)
             .map_err(Error::BusError)?;
 
         let ret = self.mmio_base;
@@ -403,6 +419,18 @@ impl MMIODeviceManager {
             state.devices.push(snapshot);
             state.interrupt_status.push(interrupt_status);
         }
+        #[cfg(target_arch = "aarch64")]
+        {
+            state.rtc = self
+                .rtc
+                .as_ref()
+                .map(|rtc| rtc.lock().expect("poisoned RTC lock").save_state());
+            state.serials = self
+                .serials
+                .iter()
+                .map(|s| s.lock().expect("poisoned serial lock").save_state())
+                .collect();
+        }
         Ok(state)
     }
 
@@ -426,6 +454,14 @@ impl MMIODeviceManager {
                 list(&mut self.virtio_devices.iter().map(|d| &d.id))
             ));
         }
+        #[cfg(target_arch = "aarch64")]
+        if state.serials.len() != self.serials.len() {
+            return Err(format!(
+                "devices differ: the checkpoint has {} serial consoles, this VM has {}",
+                state.serials.len(),
+                self.serials.len()
+            ));
+        }
         if state.devices.len() != saved.len() || state.interrupt_status.len() != saved.len() {
             return Err(format!(
                 "corrupt device state: {} devices, {} device states, {} interrupt states",
@@ -445,6 +481,20 @@ impl MMIODeviceManager {
                     .map_err(fail)?;
                 transport.set_restored_interrupt_status(*status);
                 transport.locked_device().finish_restore_activation();
+            }
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            if let (Some(rtc), Some(saved)) = (&self.rtc, &state.rtc) {
+                rtc.lock()
+                    .expect("poisoned RTC lock")
+                    .restore_state(saved);
+            }
+            for (serial, saved) in self.serials.iter().zip(&state.serials) {
+                serial
+                    .lock()
+                    .expect("poisoned serial lock")
+                    .restore_state(saved);
             }
         }
         Ok(())
@@ -792,7 +842,7 @@ mod tests {
         assert_eq!(devices[1], (first + MMIO_LEN, arch::IRQ_BASE + 1));
     }
 
-    #[cfg(checkpoint)]
+    #[cfg(all(checkpoint, target_arch = "x86_64"))]
     mod checkpoint {
         use super::*;
         use devices::virtio::block::{DiskFormat, SyncMode};
@@ -887,6 +937,7 @@ mod tests {
             let state = VmDevicesState {
                 devices: rig.blocks.iter().map(set_up).collect(),
                 interrupt_status: vec![0, 0],
+                ..Default::default()
             };
             let err = rig
                 .manager
@@ -905,6 +956,7 @@ mod tests {
             let state = VmDevicesState {
                 devices: vec![set_up(&rig.blocks[0]), spare],
                 interrupt_status: vec![0, 0],
+                ..Default::default()
             };
             rig.manager
                 .restore_devices(&rig.manager.device_ids(), &state)

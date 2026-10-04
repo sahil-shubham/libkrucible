@@ -42,11 +42,15 @@ use kbs_types::Tee;
 #[cfg(feature = "tee")]
 use crate::vmm::resources::TeeConfig;
 #[cfg(checkpoint)]
-use crate::vmm::checkpoint::codec::{Decoder, Encoder, Pod};
+use crate::vmm::checkpoint::codec::{Decoder, Encoder};
+#[cfg(all(checkpoint, target_arch = "x86_64"))]
+use crate::vmm::checkpoint::codec::Pod;
 #[cfg(checkpoint)]
-use crate::vmm::checkpoint::compat::{
-    CAP_CLOCK_REALTIME, CAP_TSC_OFFSET, CAP_TSC_SCALING, HostRecord,
-};
+use crate::vmm::checkpoint::compat::HostRecord;
+#[cfg(all(checkpoint, target_arch = "x86_64"))]
+use crate::vmm::checkpoint::compat::{CAP_CLOCK_REALTIME, CAP_TSC_OFFSET, CAP_TSC_SCALING};
+#[cfg(all(checkpoint, target_arch = "aarch64"))]
+use crate::vmm::checkpoint::compat::{self, IdReg, MIDR_EL1, REVIDR_EL1};
 use crate::vmm::vmm_config::machine_config::CpuFeaturesTemplate;
 #[cfg(target_arch = "x86_64")]
 use cpuid::{VmSpec, c3, filter_cpuid, t2};
@@ -54,7 +58,7 @@ use cpuid::{VmSpec, c3, filter_cpuid, t2};
 use kvm_bindings::kvm_userspace_memory_region;
 #[cfg(target_arch = "x86_64")]
 use kvm_bindings::{CpuId, KVM_MAX_CPUID_ENTRIES, MsrList};
-#[cfg(checkpoint)]
+#[cfg(all(checkpoint, target_arch = "x86_64"))]
 use kvm_bindings::{
     KVM_CLOCK_HOST_TSC, KVM_CLOCK_REALTIME, KVM_CLOCK_TSC_STABLE, KVM_IRQCHIP_IOAPIC,
     KVM_IRQCHIP_PIC_MASTER, KVM_IRQCHIP_PIC_SLAVE, KVM_VCPU_TSC_CTRL, KVM_VCPU_TSC_OFFSET, KVMIO,
@@ -62,8 +66,14 @@ use kvm_bindings::{
     kvm_lapic_state, kvm_mp_state, kvm_msr_entry, kvm_pit_state2, kvm_regs, kvm_sregs,
     kvm_vcpu_events, kvm_xcrs, kvm_xsave,
 };
-#[cfg(checkpoint)]
+#[cfg(all(checkpoint, target_arch = "x86_64"))]
 use vmm_sys_util::ioctl::ioctl_with_ref;
+#[cfg(all(checkpoint, target_arch = "aarch64"))]
+use super::arm64::{self, VcpuShape};
+#[cfg(all(checkpoint, target_arch = "aarch64"))]
+pub(crate) use super::arm64::VcpuState;
+#[cfg(all(checkpoint, target_arch = "aarch64"))]
+use super::vgic::{GicState, VmGic};
 use kvm_bindings::{KVM_API_VERSION, KVM_SYSTEM_EVENT_RESET, KVM_SYSTEM_EVENT_SHUTDOWN};
 #[cfg(feature = "tee")]
 use kvm_bindings::{KVM_CAP_EXIT_HYPERCALL, KVM_MEMORY_EXIT_FLAG_PRIVATE, kvm_enable_cap};
@@ -90,11 +100,11 @@ pub(crate) const VCPU_RTSIG_OFFSET: i32 = 0;
 
 // kvm-ioctls wraps the vCPU device-attribute API only for arm64/riscv64; x86
 // needs it for the TSC offset.
-#[cfg(checkpoint)]
+#[cfg(all(checkpoint, target_arch = "x86_64"))]
 vmm_sys_util::ioctl_iow_nr!(KVM_SET_DEVICE_ATTR, KVMIO, 0xe1, kvm_device_attr);
-#[cfg(checkpoint)]
+#[cfg(all(checkpoint, target_arch = "x86_64"))]
 vmm_sys_util::ioctl_iow_nr!(KVM_GET_DEVICE_ATTR, KVMIO, 0xe2, kvm_device_attr);
-#[cfg(checkpoint)]
+#[cfg(all(checkpoint, target_arch = "x86_64"))]
 vmm_sys_util::ioctl_iow_nr!(KVM_HAS_DEVICE_ATTR, KVMIO, 0xe3, kvm_device_attr);
 
 /// Errors associated with the wrappers over KVM ioctls.
@@ -231,7 +241,7 @@ pub enum Error {
     #[cfg(target_arch = "x86_64")]
     /// Failed to set KVM vcpu xsave.
     VcpuSetXsave(kvm_ioctls::Error),
-    #[cfg(checkpoint)]
+    #[cfg(all(checkpoint, target_arch = "x86_64"))]
     /// KVM read or wrote only some of a vCPU's MSRs; `first_failed` is the
     /// index of the MSR it stopped at.
     VcpuMsrsIncomplete {
@@ -239,12 +249,19 @@ pub enum Error {
         actual: usize,
         first_failed: u32,
     },
-    #[cfg(checkpoint)]
+    #[cfg(all(checkpoint, target_arch = "x86_64"))]
     /// Failed to get or set a vCPU's TSC frequency.
     VcpuTscKhz(kvm_ioctls::Error),
-    #[cfg(checkpoint)]
+    #[cfg(all(checkpoint, target_arch = "x86_64"))]
     /// Failed to get or set a vCPU's TSC offset (KVM_VCPU_TSC_OFFSET).
     VcpuTscOffset(kvm_ioctls::Error),
+    #[cfg(all(checkpoint, target_arch = "aarch64"))]
+    /// A vCPU's registers, power state or pending exceptions can't be saved
+    /// or restored.
+    VcpuArmState(String),
+    #[cfg(all(checkpoint, target_arch = "aarch64"))]
+    /// The vGIC's state can't be saved or restored.
+    VmGic(String),
     #[cfg(checkpoint)]
     /// The guest clock can't be saved or carried across a restore.
     VmClock(String),
@@ -406,7 +423,7 @@ impl Display for Error {
             VcpuSetXcrs(e) => write!(f, "Failed to set KVM vcpu xcrs: {e}"),
             #[cfg(target_arch = "x86_64")]
             VcpuSetXsave(e) => write!(f, "Failed to set KVM vcpu xsave: {e}"),
-            #[cfg(checkpoint)]
+            #[cfg(all(checkpoint, target_arch = "x86_64"))]
             VcpuMsrsIncomplete {
                 expected,
                 actual,
@@ -415,10 +432,14 @@ impl Display for Error {
                 f,
                 "KVM handled only {actual} of {expected} vCPU MSRs (stopped at MSR {first_failed:#x})"
             ),
-            #[cfg(checkpoint)]
+            #[cfg(all(checkpoint, target_arch = "x86_64"))]
             VcpuTscKhz(e) => write!(f, "KVM vCPU TSC frequency: {e}"),
-            #[cfg(checkpoint)]
+            #[cfg(all(checkpoint, target_arch = "x86_64"))]
             VcpuTscOffset(e) => write!(f, "KVM vCPU TSC offset: {e}"),
+            #[cfg(all(checkpoint, target_arch = "aarch64"))]
+            VcpuArmState(e) => write!(f, "vCPU state: {e}"),
+            #[cfg(all(checkpoint, target_arch = "aarch64"))]
+            VmGic(e) => write!(f, "GIC: {e}"),
             #[cfg(checkpoint)]
             VmClock(e) => write!(f, "guest clock: {e}"),
             VcpuSpawn(e) => write!(f, "Cannot spawn a new vCPU thread: {e}"),
@@ -522,10 +543,22 @@ impl KvmContext {
 /// Whether this host's KVM can restore a checkpoint: carrying the guest's
 /// clock across the gap needs KVM_SET_CLOCK to take KVM_CLOCK_REALTIME
 /// (Linux 5.16+).
-#[cfg(checkpoint)]
+#[cfg(all(checkpoint, target_arch = "x86_64"))]
 pub fn checkpoint_supported() -> bool {
     Kvm::new()
         .is_ok_and(|kvm| kvm.check_extension_int(AdjustClock) as u32 & KVM_CLOCK_REALTIME != 0)
+}
+
+/// Whether this host's KVM can save and restore a VM: a vCPU's power state
+/// and pending exceptions, besides the registers and vGIC state every arm64
+/// KVM exposes (Linux 4.19+).
+#[cfg(all(checkpoint, target_arch = "aarch64"))]
+pub fn checkpoint_supported() -> bool {
+    Kvm::new().is_ok_and(|kvm| {
+        kvm.check_extension(MpState)
+            && kvm.check_extension(VcpuEvents)
+            && kvm.check_extension(DeviceCtrl)
+    })
 }
 
 /// A wrapper around creating and using a VM.
@@ -538,6 +571,10 @@ pub struct Vm {
     supported_cpuid: CpuId,
     #[cfg(target_arch = "x86_64")]
     supported_msrs: MsrList,
+
+    /// The in-kernel vGIC, whose state a checkpoint holds.
+    #[cfg(all(checkpoint, target_arch = "aarch64"))]
+    gic: Option<VmGic>,
 
     #[cfg(feature = "amd-sev")]
     tee: Option<AmdSnp>,
@@ -571,6 +608,8 @@ impl Vm {
             supported_cpuid,
             #[cfg(target_arch = "x86_64")]
             supported_msrs,
+            #[cfg(all(checkpoint, target_arch = "aarch64"))]
+            gic: None,
         })
     }
 
@@ -902,7 +941,7 @@ impl Vm {
         &self.fd
     }
 
-    #[cfg(checkpoint)]
+    #[cfg(all(checkpoint, target_arch = "x86_64"))]
     /// The VM-wide KVM state a checkpoint carries: PIT, PICs, IOAPIC and kvmclock.
     pub fn save_state(&self) -> Result<VmState> {
         let pitstate = self.fd.get_pit2().map_err(Error::VmGetPit2)?;
@@ -957,7 +996,7 @@ impl Vm {
         })
     }
 
-    #[cfg(checkpoint)]
+    #[cfg(all(checkpoint, target_arch = "x86_64"))]
     /// Restores the VM-wide state. The kvmclock moves on by the wall-clock
     /// time since the save (the saved clock carries KVM_CLOCK_REALTIME).
     pub fn restore_state(&self, state: &VmState) -> Result<()> {
@@ -977,7 +1016,7 @@ impl Vm {
         Ok(())
     }
 
-    #[cfg(checkpoint)]
+    #[cfg(all(checkpoint, target_arch = "x86_64"))]
     /// After [`Self::restore_state`] moved the guest's kvmclock on by the time
     /// the VM spent saved, move each vCPU's TSC on by the same amount. Left
     /// alone, the TSC would resume where it stopped, behind the guest's own
@@ -1020,7 +1059,7 @@ impl Vm {
         Ok(())
     }
 
-    #[cfg(checkpoint)]
+    #[cfg(all(checkpoint, target_arch = "x86_64"))]
     /// The host record a checkpoint of this VM carries: this host's CPU, what
     /// the guest was given (`vcpu0` as saved; every vCPU gets the same CPUID
     /// and TSC rate) and the KVM capabilities its state depends on.
@@ -1037,7 +1076,7 @@ impl Vm {
         HostRecord::here(vcpu0.cpuid.as_slice(), vcpu0.tsc.khz, caps, msrs)
     }
 
-    #[cfg(checkpoint)]
+    #[cfg(all(checkpoint, target_arch = "x86_64"))]
     /// This host as a restore into this VM meets a checkpoint: the CPUID
     /// `vcpu` (configured, not yet restored) gives a guest, the TSC rate it
     /// runs at before a restore sets one, the KVM capabilities a restore uses
@@ -1054,7 +1093,7 @@ impl Vm {
 
 /// What this host offers a restored guest, given the VM and a vCPU created
 /// for it and the CPUID configured for that vCPU.
-#[cfg(checkpoint)]
+#[cfg(all(checkpoint, target_arch = "x86_64"))]
 fn host_offer(
     vm: &VmFd,
     vcpu: &VcpuFd,
@@ -1085,7 +1124,7 @@ fn host_offer(
 /// This host's record for restoring a checkpoint with `vcpu_count` vCPUs,
 /// taken from a throwaway VM without building one for the guest: what
 /// [`Vm::restore_host_record`] gives for the VM a restore builds.
-#[cfg(checkpoint)]
+#[cfg(all(checkpoint, target_arch = "x86_64"))]
 pub fn probe_host(vcpu_count: u8) -> Result<HostRecord> {
     let kvm = Kvm::new().map_err(Error::VmFd)?;
     let vm = kvm.create_vm().map_err(Error::VmFd)?;
@@ -1100,7 +1139,155 @@ pub fn probe_host(vcpu_count: u8) -> Result<HostRecord> {
     host_offer(&vm, &vcpu, cpuid.as_slice(), &msrs)
 }
 
-#[cfg(checkpoint)]
+/// Checkpoints on arm64: the VM-wide state a checkpoint carries is the
+/// in-kernel vGIC's.
+#[cfg(all(checkpoint, target_arch = "aarch64"))]
+impl Vm {
+    /// Hands the VM its vGIC (`intc`, KVM's in-kernel one) for checkpoints to
+    /// save and restore; `mpidrs` are its vCPUs' MPIDR_EL1s, by index.
+    pub fn set_gic(&mut self, intc: &devices::legacy::IrqChip, mpidrs: Vec<u64>) -> Result<()> {
+        self.gic = Some(VmGic::of(intc, mpidrs).map_err(Error::VmGic)?);
+        Ok(())
+    }
+
+    fn gic(&self) -> Result<&VmGic> {
+        self.gic
+            .as_ref()
+            .ok_or_else(|| Error::VmGic("the VM has no in-kernel vGIC".into()))
+    }
+
+    /// The VM-wide KVM state a checkpoint carries: the vGIC's. The vCPUs
+    /// must be out of KVM_RUN.
+    pub fn save_state(&self) -> Result<VmState> {
+        Ok(VmState {
+            gic: self.gic()?.save().map_err(Error::VmGic)?,
+        })
+    }
+
+    /// Restores the vGIC; the vCPUs must not have run.
+    pub fn restore_state(&self, state: &VmState) -> Result<()> {
+        self.gic()?.restore(&state.gic).map_err(Error::VmGic)
+    }
+
+    /// The host record a checkpoint of this VM carries: the CPU and ID
+    /// registers the guest saw (`vcpu0` as saved; every vCPU is created
+    /// alike), what its vCPUs were created as, the counter frequency it ran
+    /// at, its GIC version and the registers its vCPU state holds.
+    pub fn host_record(&self, vcpu0: &VcpuState) -> HostRecord {
+        HostRecord {
+            midr: vcpu0.reg_u64(MIDR_EL1).unwrap_or(0),
+            revidr: vcpu0.reg_u64(REVIDR_EL1).unwrap_or(0),
+            page_size: compat::page_size(),
+            counter_hz: vcpu0.counter.hz,
+            gic_version: self.gic.as_ref().map_or(0, |g| g.version),
+            vcpu_features: vcpu0.features,
+            sve_vls: vcpu0.reg(arm64::SVE_VLS).map(u64_words).unwrap_or_default(),
+            id_regs: vcpu0
+                .regs
+                .iter()
+                .filter(|r| compat::is_feature_id_reg(r.id))
+                .filter_map(|r| {
+                    Some(IdReg {
+                        id: r.id,
+                        value: u64::from_le_bytes(r.value.as_slice().try_into().ok()?),
+                    })
+                })
+                .collect(),
+            regs: vcpu0.regs.iter().map(|r| r.id).collect(),
+        }
+    }
+}
+
+/// Little-endian bytes as u64 words.
+#[cfg(all(checkpoint, target_arch = "aarch64"))]
+fn u64_words(bytes: &[u8]) -> Vec<u64> {
+    bytes
+        .chunks_exact(8)
+        .map(|w| u64::from_le_bytes(w.try_into().unwrap()))
+        .collect()
+}
+
+/// This host's record for restoring a checkpoint, from a throwaway VM: a
+/// vCPU created with every feature KVM here can give one, then the vGIC a VM
+/// built here gets (its model shows in the ID registers). A restore judges a
+/// checkpoint by this before it creates anything for the guest, so a host
+/// that can't run it is refused with nothing set up.
+#[cfg(all(checkpoint, target_arch = "aarch64"))]
+pub fn probe_host(_vcpu_count: u8) -> Result<HostRecord> {
+    let kvm = Kvm::new().map_err(Error::VmFd)?;
+    let vm = kvm.create_vm().map_err(Error::VmFd)?;
+    let vcpu = vm.create_vcpu(0).map_err(Error::VcpuFd)?;
+    let features = vcpu_features(&vm);
+    let mut kvi = kvm_bindings::kvm_vcpu_init::default();
+    vm.get_preferred_target(&mut kvi)
+        .map_err(Error::VcpuArmPreferredTarget)?;
+    kvi.features[0] |= features;
+    vcpu.vcpu_init(&kvi).map_err(Error::VcpuArmInit)?;
+    let mut sve_vls = Vec::new();
+    if features & 1 << kvm_bindings::KVM_ARM_VCPU_SVE != 0 {
+        // Before the vCPU is finalized, every vector length the host has.
+        let mut vls = [0u8; 64];
+        vcpu.get_one_reg(arm64::SVE_VLS, &mut vls)
+            .map_err(|e| Error::VcpuArmState(format!("read the SVE vector lengths: {e}")))?;
+        sve_vls = u64_words(&vls);
+        vcpu.vcpu_finalize(&(kvm_bindings::KVM_ARM_VCPU_SVE as std::os::raw::c_int))
+            .map_err(Error::VcpuArmFinalize)?;
+    }
+    // As the builder does: a GICv3 where KVM can give one, else a GICv2.
+    let gic = |type_| {
+        vm.create_device(&mut kvm_bindings::kvm_create_device {
+            type_,
+            fd: 0,
+            flags: 0,
+        })
+    };
+    let gic_version = if gic(kvm_bindings::kvm_device_type_KVM_DEV_TYPE_ARM_VGIC_V3).is_ok() {
+        3
+    } else {
+        gic(kvm_bindings::kvm_device_type_KVM_DEV_TYPE_ARM_VGIC_V2)
+            .map_err(|e| Error::VmGic(format!("create a vGIC: {e}")))?;
+        2
+    };
+    let regs = arm64::reg_list(&vcpu).map_err(Error::VcpuArmState)?;
+    let read = |id| arm64::read_u64(&vcpu, id).map_err(Error::VcpuArmState);
+    let id_regs = regs
+        .iter()
+        .filter(|&&id| compat::is_feature_id_reg(id))
+        .map(|&id| Ok(IdReg { id, value: read(id)? }))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(HostRecord {
+        midr: read(MIDR_EL1)?,
+        revidr: read(REVIDR_EL1)?,
+        page_size: compat::page_size(),
+        counter_hz: arm64::counter_hz(),
+        gic_version,
+        vcpu_features: features,
+        sve_vls,
+        id_regs,
+        regs,
+    })
+}
+
+#[cfg(all(checkpoint, target_arch = "aarch64"))]
+/// The VM-wide KVM state a checkpoint carries on arm64.
+pub struct VmState {
+    gic: GicState,
+}
+
+#[cfg(all(checkpoint, target_arch = "aarch64"))]
+impl VmState {
+    pub(crate) fn encode(&self, enc: &mut Encoder) {
+        self.gic.encode(enc);
+    }
+
+    pub(crate) fn decode(dec: &mut Decoder) -> std::result::Result<Self, String> {
+        Ok(VmState {
+            gic: GicState::decode(dec)?,
+        })
+    }
+}
+
+#[cfg(all(checkpoint, target_arch = "x86_64"))]
 /// Structure holding VM kvm state.
 pub struct VmState {
     pitstate: kvm_pit_state2,
@@ -1110,7 +1297,7 @@ pub struct VmState {
     ioapic: kvm_irqchip,
 }
 
-#[cfg(checkpoint)]
+#[cfg(all(checkpoint, target_arch = "x86_64"))]
 impl VmState {
     pub(crate) fn encode(&self, enc: &mut Encoder) {
         enc.pod(&self.pitstate);
@@ -1132,7 +1319,7 @@ impl VmState {
 }
 
 // SAFETY: KVM uapi structs: #[repr(C)] integers, arrays and unions of them.
-#[cfg(checkpoint)]
+#[cfg(all(checkpoint, target_arch = "x86_64"))]
 mod pod {
     use super::*;
     unsafe impl Pod for kvm_pit_state2 {}
@@ -1152,7 +1339,7 @@ mod pod {
 
 /// The vCPU device attribute holding KVM's guest TSC offset; `addr` is where
 /// KVM reads or writes the u64.
-#[cfg(checkpoint)]
+#[cfg(all(checkpoint, target_arch = "x86_64"))]
 fn tsc_offset_attr(addr: u64) -> kvm_device_attr {
     kvm_device_attr {
         group: KVM_VCPU_TSC_CTRL,
@@ -1163,24 +1350,25 @@ fn tsc_offset_attr(addr: u64) -> kvm_device_attr {
 }
 
 #[cfg(checkpoint)]
-fn realtime_ns() -> Result<u64> {
+pub(super) fn realtime_ns() -> Result<u64> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_err(|e| Error::VmClock(format!("host clock is before 1970: {e}")))?;
     u64::try_from(now.as_nanos()).map_err(|_| Error::VmClock("host clock overflows u64 ns".into()))
 }
 
-/// The midpoint of two CLOCK_REALTIME reads taken around KVM_GET_CLOCK.
+/// The midpoint of two CLOCK_REALTIME reads taken around a read of the
+/// guest's clock (the kvmclock, or the virtual counter).
 #[cfg(checkpoint)]
-fn midpoint(before: u64, after: u64) -> Result<u64> {
+pub(super) fn midpoint(before: u64, after: u64) -> Result<u64> {
     // Wider than a descheduled thread needs, narrow enough to matter.
     const MAX_WINDOW_NS: u64 = 100_000_000;
     let window = after.checked_sub(before).ok_or_else(|| {
-        Error::VmClock("host wall clock stepped back while sampling the kvmclock".into())
+        Error::VmClock("host wall clock stepped back while sampling the guest's clock".into())
     })?;
     if window > MAX_WINDOW_NS {
         return Err(Error::VmClock(format!(
-            "sampling the kvmclock took {window} ns"
+            "sampling the guest's clock took {window} ns"
         )));
     }
     Ok(before + window / 2)
@@ -1188,7 +1376,7 @@ fn midpoint(before: u64, after: u64) -> Result<u64> {
 
 /// The KVM migration relation for a vCPU's TSC offset (wrapping arithmetic:
 /// offsets and TSCs are u64 modulo 2^64).
-#[cfg(checkpoint)]
+#[cfg(all(checkpoint, target_arch = "x86_64"))]
 fn rebased_tsc_offset(
     offset: u64,
     khz: u32,
@@ -1204,7 +1392,7 @@ fn rebased_tsc_offset(
         .wrapping_sub(now_host_tsc.wrapping_sub(saved_host_tsc))
 }
 
-#[cfg(checkpoint)]
+#[cfg(all(checkpoint, target_arch = "x86_64"))]
 fn advance_tsc(tsc: u64, elapsed_ns: i128, khz: u32) -> u64 {
     let ticks = elapsed_ns * i128::from(khz) / 1_000_000;
     tsc.wrapping_add(ticks.rem_euclid(1 << 64) as u64)
@@ -1246,6 +1434,11 @@ pub struct Vcpu {
 
     #[cfg(target_arch = "aarch64")]
     mpidr: u64,
+    /// The `kvm_vcpu_init` features (bit n: feature n) the vCPU was created
+    /// with, POWER_OFF aside.
+    #[cfg(target_arch = "aarch64")]
+    #[cfg_attr(not(checkpoint), allow(dead_code))]
+    features: u32,
 
     // The receiving end of events channel owned by the vcpu side.
     event_receiver: Receiver<VcpuEvent>,
@@ -1272,6 +1465,30 @@ struct PauseClock {
     /// The guest virtual counter at pause; written back on resume.
     #[cfg(target_arch = "aarch64")]
     timer_cnt: u64,
+}
+
+/// The `kvm_vcpu_init` features (bit n: feature n) a vCPU gets here: PSCI
+/// 0.2 (we already checked that the capability is supported), and pointer
+/// authentication and SVE where KVM can virtualise them.
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn vcpu_features(vm_fd: &VmFd) -> u32 {
+    let mut features = 1 << kvm_bindings::KVM_ARM_VCPU_PSCI_0_2;
+    if vm_fd.check_extension(kvm_ioctls::Cap::ArmPtrAuthAddress) {
+        features |= 1 << kvm_bindings::KVM_ARM_VCPU_PTRAUTH_ADDRESS;
+    }
+    if vm_fd.check_extension(kvm_ioctls::Cap::ArmPtrAuthGeneric) {
+        features |= 1 << kvm_bindings::KVM_ARM_VCPU_PTRAUTH_GENERIC;
+    }
+    if vm_fd.check_extension(kvm_ioctls::Cap::ArmSve) {
+        features |= 1 << kvm_bindings::KVM_ARM_VCPU_SVE;
+    }
+    features
+}
+
+/// Maps a KVM error while doing `what` to an arm64 vCPU's state.
+#[cfg(all(checkpoint, target_arch = "aarch64"))]
+fn arm_state_error(what: &'static str) -> impl Fn(kvm_ioctls::Error) -> Error {
+    move |e| Error::VcpuArmState(format!("{what}: {e}"))
 }
 
 impl Vcpu {
@@ -1430,6 +1647,7 @@ impl Vcpu {
             mmio_bus: None,
             exit_evt,
             mpidr: 0,
+            features: 0,
             event_receiver,
             event_sender: Some(event_sender),
             response_receiver: Some(response_receiver),
@@ -1546,11 +1764,14 @@ impl Vcpu {
     /// * `vm_fd` - The kvm `VmFd` for this microvm.
     /// * `guest_mem` - The guest memory used by this microvm.
     /// * `kernel_load_addr` - Offset from `guest_mem` at which the kernel is loaded.
+    /// * `shape` - For a restore: create the vCPU as the saved one was, not
+    ///   with everything this host offers.
     pub fn configure_aarch64(
         &mut self,
         vm_fd: &VmFd,
         mem_info: &ArchMemoryInfo,
         kernel_load_addr: GuestAddress,
+        #[cfg(checkpoint)] shape: Option<&VcpuShape>,
     ) -> Result<()> {
         let mut kvi: kvm_bindings::kvm_vcpu_init = kvm_bindings::kvm_vcpu_init::default();
 
@@ -1558,30 +1779,29 @@ impl Vcpu {
         vm_fd
             .get_preferred_target(&mut kvi)
             .map_err(Error::VcpuArmPreferredTarget)?;
-        // We already checked that the capability is supported.
-        kvi.features[0] |= 1 << kvm_bindings::KVM_ARM_VCPU_PSCI_0_2;
+        #[cfg(checkpoint)]
+        let features = shape.map_or_else(|| vcpu_features(vm_fd), |s| s.features);
+        #[cfg(not(checkpoint))]
+        let features = vcpu_features(vm_fd);
+        kvi.features[0] |= features;
         // Non-boot cpus are powered off initially.
         if self.id > 0 {
             kvi.features[0] |= 1 << kvm_bindings::KVM_ARM_VCPU_POWER_OFF;
         }
 
-        if vm_fd.check_extension(kvm_ioctls::Cap::ArmPtrAuthAddress) {
-            kvi.features[0] |= 1 << kvm_bindings::KVM_ARM_VCPU_PTRAUTH_ADDRESS;
-        }
-        if vm_fd.check_extension(kvm_ioctls::Cap::ArmPtrAuthGeneric) {
-            kvi.features[0] |= 1 << kvm_bindings::KVM_ARM_VCPU_PTRAUTH_GENERIC;
-        }
-
-        // Expose SVE to the guest when the host can virtualise it.
-        let sve = vm_fd.check_extension(kvm_ioctls::Cap::ArmSve);
-        if sve {
-            kvi.features[0] |= 1 << kvm_bindings::KVM_ARM_VCPU_SVE;
-        }
-
         self.fd.vcpu_init(&kvi).map_err(Error::VcpuArmInit)?;
 
         // Must precede any register access; KVM returns -EPERM until finalized.
-        if sve {
+        if features & 1 << kvm_bindings::KVM_ARM_VCPU_SVE != 0 {
+            // A restored guest keeps its vector lengths, which KVM only
+            // takes before the vCPU is finalized.
+            #[cfg(checkpoint)]
+            if let Some(vls) = shape.map(|s| &s.sve_vls).filter(|v| !v.is_empty()) {
+                let bytes: Vec<u8> = vls.iter().flat_map(|w| w.to_le_bytes()).collect();
+                self.fd.set_one_reg(arm64::SVE_VLS, &bytes).map_err(|e| {
+                    Error::VcpuArmState(format!("set the guest's SVE vector lengths: {e}"))
+                })?;
+            }
             self.fd
                 .vcpu_finalize(&(kvm_bindings::KVM_ARM_VCPU_SVE as std::os::raw::c_int))
                 .map_err(Error::VcpuArmFinalize)?;
@@ -1591,6 +1811,7 @@ impl Vcpu {
             .map_err(Error::REGSConfiguration)?;
 
         self.mpidr = arch::aarch64::regs::read_mpidr(&self.fd).map_err(Error::REGSConfiguration)?;
+        self.features = features;
 
         Ok(())
     }
@@ -1645,7 +1866,7 @@ impl Vcpu {
         ))
     }
 
-    #[cfg(checkpoint)]
+    #[cfg(all(checkpoint, target_arch = "x86_64"))]
     fn save_state(&self) -> Result<VcpuState> {
         /*
          * Ordering requirements:
@@ -1710,7 +1931,7 @@ impl Vcpu {
         })
     }
 
-    #[cfg(checkpoint)]
+    #[cfg(all(checkpoint, target_arch = "x86_64"))]
     fn restore_state(&mut self, state: VcpuState) -> Result<()> {
         /*
          * Ordering requirements:
@@ -1780,7 +2001,7 @@ impl Vcpu {
         Ok(())
     }
 
-    #[cfg(checkpoint)]
+    #[cfg(all(checkpoint, target_arch = "x86_64"))]
     fn save_tsc(&self) -> Result<TscState> {
         let khz = self.fd.get_tsc_khz().map_err(Error::VcpuTscKhz)?;
         let mut offset = 0u64;
@@ -1805,7 +2026,7 @@ impl Vcpu {
         })
     }
 
-    #[cfg(checkpoint)]
+    #[cfg(all(checkpoint, target_arch = "x86_64"))]
     fn set_tsc_offset(&self, offset: u64) -> Result<()> {
         let attr = tsc_offset_attr(&offset as *const u64 as u64);
         // SAFETY: `attr.addr` points at `offset`, which outlives the call; KVM
@@ -1814,6 +2035,60 @@ impl Vcpu {
             return Err(Error::VcpuTscOffset(kvm_ioctls::Error::last()));
         }
         Ok(())
+    }
+
+    /// The vCPU's state for a checkpoint: every register KVM lists for it,
+    /// its power state and pending exceptions, and its virtual counter read
+    /// against wall-clock time. The vCPU must be out of KVM_RUN.
+    #[cfg(all(checkpoint, target_arch = "aarch64"))]
+    fn save_state(&self) -> Result<VcpuState> {
+        Ok(VcpuState {
+            features: self.features,
+            regs: arm64::read_regs(&self.fd).map_err(Error::VcpuArmState)?,
+            mp_state: self
+                .fd
+                .get_mp_state()
+                .map_err(arm_state_error("read the power state"))?,
+            events: self
+                .fd
+                .get_vcpu_events()
+                .map_err(arm_state_error("read the pending exceptions"))?,
+            counter: arm64::sample_counter(&self.fd).map_err(Error::VcpuArmState)?,
+        })
+    }
+
+    /// Loads a checkpointed vCPU's state into this one, which was created as
+    /// the saved one was (see [`Self::configure_aarch64`]). Its virtual
+    /// counter moves on by the wall-clock time since the save: the guest's
+    /// clocks show the time that passed, and its timers run out as if it had
+    /// kept running.
+    #[cfg(all(checkpoint, target_arch = "aarch64"))]
+    fn restore_state(&mut self, state: VcpuState) -> Result<()> {
+        if state.features != self.features {
+            return Err(Error::VcpuArmState(format!(
+                "the vCPU was created with features {:#x}; the saved one had {:#x}",
+                self.features, state.features
+            )));
+        }
+        for reg in state
+            .regs
+            .iter()
+            .filter(|r| arm64::restored_as_saved(r.id))
+        {
+            self.fd.set_one_reg(reg.id, &reg.value).map_err(|e| {
+                Error::VcpuArmState(format!("restore {}: {e}", compat::reg_name(reg.id)))
+            })?;
+        }
+        self.fd
+            .set_mp_state(state.mp_state)
+            .map_err(arm_state_error("restore the power state"))?;
+        self.fd
+            .set_vcpu_events(&state.events)
+            .map_err(arm_state_error("restore the pending exceptions"))?;
+        let count = state.counter.at(realtime_ns()?);
+        arch::aarch64::regs::write_timer_cnt(&self.fd, count).map_err(|e| {
+            Error::VcpuArmState(format!("restore the virtual counter: {e:?}"))
+        })
     }
 
     /// Runs the vCPU in KVM context and handles the kvm exit reason.
@@ -2106,8 +2381,13 @@ impl Vcpu {
                     Ok(()) => {
                         // The guest was frozen while it sat on disk: on resume,
                         // tell it (KVM_KVMCLOCK_CTRL) so its soft-lockup
-                        // watchdog doesn't count the gap as a hung CPU.
-                        self.pause_clock.live = true;
+                        // watchdog doesn't count the gap as a hung CPU. arm64
+                        // has nothing to tell, and its counter, just set, must
+                        // stay as the restore left it.
+                        #[cfg(target_arch = "x86_64")]
+                        {
+                            self.pause_clock.live = true;
+                        }
                         VcpuResponse::RestoredState
                     }
                     Err(e) => VcpuResponse::RestoreFailed(e.to_string()),
@@ -2175,7 +2455,7 @@ impl Drop for Vcpu {
     }
 }
 
-#[cfg(checkpoint)]
+#[cfg(all(checkpoint, target_arch = "x86_64"))]
 /// Structure holding VCPU kvm state.
 pub struct VcpuState {
     cpuid: CpuId,
@@ -2192,7 +2472,7 @@ pub struct VcpuState {
 }
 
 /// A vCPU's TSC as KVM runs it.
-#[cfg(checkpoint)]
+#[cfg(all(checkpoint, target_arch = "x86_64"))]
 #[derive(Clone, Copy)]
 struct TscState {
     /// The guest TSC rate.
@@ -2205,7 +2485,7 @@ struct TscState {
     apply_offset: bool,
 }
 
-#[cfg(checkpoint)]
+#[cfg(all(checkpoint, target_arch = "x86_64"))]
 impl std::fmt::Debug for VcpuState {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         // Kilobytes of raw registers; a marker keeps `VcpuEvent: Debug` cheap.
@@ -2213,7 +2493,7 @@ impl std::fmt::Debug for VcpuState {
     }
 }
 
-#[cfg(checkpoint)]
+#[cfg(all(checkpoint, target_arch = "x86_64"))]
 impl VcpuState {
     pub(crate) fn encode(&self, enc: &mut Encoder) {
         enc.pods(self.cpuid.as_slice());
@@ -2271,7 +2551,7 @@ impl VcpuState {
 
 /// Fails unless KVM read or wrote every MSR in `msrs` (`done` is what the
 /// ioctl returned: it stops at the first MSR it can't handle).
-#[cfg(checkpoint)]
+#[cfg(all(checkpoint, target_arch = "x86_64"))]
 fn msrs_complete(msrs: &Msrs, done: usize) -> Result<()> {
     let entries = msrs.as_slice();
     if done == entries.len() {
@@ -2369,7 +2649,7 @@ enum VcpuEmulation {
 
 /// Real VM and vCPU state from a throwaway KVM VM, for tests of the layers
 /// that store it.
-#[cfg(all(test, checkpoint))]
+#[cfg(all(test, checkpoint, target_arch = "x86_64"))]
 pub(crate) fn sample_states(vcpus: u8) -> (VmState, Vec<VcpuState>) {
     let kvm = KvmContext::new().unwrap();
     let mut vm = Vm::new(kvm.fd()).unwrap();
@@ -2399,6 +2679,51 @@ pub(crate) fn sample_states(vcpus: u8) -> (VmState, Vec<VcpuState>) {
             vcpu.save_state().unwrap()
         })
         .collect();
+    (vm.save_state().unwrap(), states)
+}
+
+/// A VM built as the builder builds one on arm64: `vcpus` configured vCPUs,
+/// then a GICv3 where KVM can give one, else a GICv2. The vCPUs never run.
+#[cfg(all(test, checkpoint, target_arch = "aarch64"))]
+pub(crate) fn test_vm(vcpus: u8) -> (Vm, Vec<Vcpu>, devices::legacy::IrqChip) {
+    use devices::legacy::{IrqChipDevice, KvmGicV2, KvmGicV3};
+    use std::sync::{Arc, Mutex};
+
+    let kvm = KvmContext::new().unwrap();
+    let mut vm = Vm::new(kvm.fd()).unwrap();
+    let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0x8000_0000), 0x10_0000)]).unwrap();
+    vm.memory_init(&mem, kvm.max_memslots()).unwrap();
+    let vcpus: Vec<Vcpu> = (0..vcpus)
+        .map(|id| {
+            let exit_evt = EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap();
+            let mut vcpu = Vcpu::new_aarch64(id, vm.fd(), exit_evt).unwrap();
+            vcpu.configure_aarch64(
+                vm.fd(),
+                &ArchMemoryInfo::default(),
+                GuestAddress(0x8000_0000),
+                None,
+            )
+            .unwrap();
+            vcpu
+        })
+        .collect();
+    let count = vcpus.len() as u64;
+    let gic = match KvmGicV3::new(vm.fd(), count) {
+        Ok(v3) => IrqChipDevice::new(Box::new(v3)),
+        Err(_) => IrqChipDevice::new(Box::new(KvmGicV2::new(vm.fd(), count))),
+    };
+    let intc: devices::legacy::IrqChip = Arc::new(Mutex::new(gic));
+    vm.set_gic(&intc, vcpus.iter().map(Vcpu::get_mpidr).collect())
+        .unwrap();
+    (vm, vcpus, intc)
+}
+
+/// Real VM and vCPU state from a throwaway KVM VM, for tests of the layers
+/// that store it.
+#[cfg(all(test, checkpoint, target_arch = "aarch64"))]
+pub(crate) fn sample_states(vcpus: u8) -> (VmState, Vec<VcpuState>) {
+    let (vm, vcpus, _intc) = test_vm(vcpus);
+    let states = vcpus.iter().map(|v| v.save_state().unwrap()).collect();
     (vm.save_state().unwrap(), states)
 }
 
@@ -2554,6 +2879,8 @@ mod tests {
             &Payload::Empty,
             #[cfg(feature = "tee")]
             None,
+            #[cfg(checkpoint)]
+            None,
         )
         .unwrap();
         let mut vm = Vm::new(kvm.fd()).expect("new vm failed");
@@ -2568,8 +2895,14 @@ mod tests {
         .unwrap();
 
         assert!(
-            vcpu.configure_aarch64(vm.fd(), &arch_memory_info, GuestAddress(0))
-                .is_ok()
+            vcpu.configure_aarch64(
+                vm.fd(),
+                &arch_memory_info,
+                GuestAddress(0),
+                #[cfg(checkpoint)]
+                None
+            )
+            .is_ok()
         );
 
         // Try it for when vcpu id is NOT 0.
@@ -2581,8 +2914,14 @@ mod tests {
         .unwrap();
 
         assert!(
-            vcpu.configure_aarch64(vm.fd(), &arch_memory_info, GuestAddress(0))
-                .is_ok()
+            vcpu.configure_aarch64(
+                vm.fd(),
+                &arch_memory_info,
+                GuestAddress(0),
+                #[cfg(checkpoint)]
+                None
+            )
+            .is_ok()
         );
     }
 
@@ -2674,7 +3013,7 @@ mod tests {
 
     /// A vCPU configured for boot, then given distinctive register and MSR
     /// values, as a checkpoint source.
-    #[cfg(checkpoint)]
+    #[cfg(all(checkpoint, target_arch = "x86_64"))]
     fn distinctive_vcpu() -> (Vm, Vcpu, GuestMemoryMmap, kvm_regs) {
         use arch_gen::x86::msr_index::{MSR_KERNEL_GS_BASE, MSR_LSTAR};
 
@@ -2719,7 +3058,7 @@ mod tests {
         state
     }
 
-    #[cfg(checkpoint)]
+    #[cfg(all(checkpoint, target_arch = "x86_64"))]
     #[test]
     fn vcpu_state_survives_encoding_into_a_fresh_vcpu() {
         use arch_gen::x86::msr_index::{MSR_KERNEL_GS_BASE, MSR_LSTAR};
@@ -2758,7 +3097,7 @@ mod tests {
         assert_eq!(msrs.as_slice()[1].data, 0xffff_8880_0000_1000);
     }
 
-    #[cfg(checkpoint)]
+    #[cfg(all(checkpoint, target_arch = "x86_64"))]
     #[test]
     fn partial_msr_restore_is_an_error() {
         let (_vm, vcpu, _mem, _) = distinctive_vcpu();
@@ -2789,7 +3128,7 @@ mod tests {
         }
     }
 
-    #[cfg(checkpoint)]
+    #[cfg(all(checkpoint, target_arch = "x86_64"))]
     #[test]
     fn vm_state_survives_encoding_into_a_fresh_vm() {
         let (vm, _vcpu, _mem) = setup_vcpu(0x1000);
@@ -2826,7 +3165,7 @@ mod tests {
         assert_eq!(unsafe { got.chip.ioapic.redirtbl[5].bits }, 0x31);
     }
 
-    #[cfg(checkpoint)]
+    #[cfg(all(checkpoint, target_arch = "x86_64"))]
     fn guest_tsc(vcpu: &Vcpu) -> u64 {
         let mut msrs = Msrs::from_entries(&[kvm_msr_entry {
             index: arch_gen::x86::msr_index::MSR_IA32_TSC,
@@ -2840,7 +3179,7 @@ mod tests {
     /// A restore some time after the save must move the guest's kvmclock and
     /// every vCPU's TSC on by that time, together: a guest whose clock jumps
     /// while its TSC doesn't sees time and its timers disagree.
-    #[cfg(checkpoint)]
+    #[cfg(all(checkpoint, target_arch = "x86_64"))]
     #[test]
     fn restore_moves_guest_clock_and_tsc_on_by_the_gap() {
         let (vm, vcpu, _mem, _) = distinctive_vcpu();
@@ -2877,7 +3216,7 @@ mod tests {
         }
     }
 
-    #[cfg(checkpoint)]
+    #[cfg(all(checkpoint, target_arch = "x86_64"))]
     #[test]
     fn rebased_offset_keeps_the_guest_tsc_counting_through_the_gap() {
         let khz: u32 = 3_600_000;
@@ -2919,7 +3258,7 @@ mod tests {
     /// The import-time check (`probe_host`, a throwaway VM) and the restore
     /// (the VM it builds) must judge a checkpoint alike: one may not admit
     /// what the other refuses.
-    #[cfg(checkpoint)]
+    #[cfg(all(checkpoint, target_arch = "x86_64"))]
     #[test]
     fn the_host_probe_matches_the_vm_a_restore_builds() {
         let (vm, vcpu, _mem, _) = distinctive_vcpu();
@@ -2929,7 +3268,7 @@ mod tests {
         assert!(restore.kvm_caps & CAP_CLOCK_REALTIME != 0, "{restore:?}");
     }
 
-    #[cfg(checkpoint)]
+    #[cfg(all(checkpoint, target_arch = "x86_64"))]
     #[test]
     fn a_checkpoint_passes_on_the_host_that_took_it() {
         let (vm, vcpu, _mem, _) = distinctive_vcpu();
@@ -2945,5 +3284,141 @@ mod tests {
         foreign.cpuid[0].bits |= 1 << absent;
         let err = foreign.check(&probe_host(1).unwrap()).unwrap_err();
         assert!(err.contains("lacks features the guest uses"), "{err}");
+    }
+
+    /// Gives `vcpu` distinctive register values, as a checkpoint source:
+    /// general purpose, EL1 system and (without SVE) FP/SIMD registers.
+    #[cfg(all(checkpoint, target_arch = "aarch64"))]
+    fn distinctive_regs(vcpu: &Vcpu) -> Vec<(u64, Vec<u8>)> {
+        use kvm_bindings::{KVM_REG_ARM_CORE, KVM_REG_ARM64, KVM_REG_SIZE_U64, kvm_regs};
+        let core = |offset: usize| {
+            KVM_REG_ARM64 | KVM_REG_SIZE_U64 | u64::from(KVM_REG_ARM_CORE) | (offset / 4) as u64
+        };
+        let mut regs = vec![
+            (core(0), 0x1122_3344_5566_7788u64.to_le_bytes().to_vec()), // x0
+            (
+                core(std::mem::offset_of!(kvm_regs, sp_el1)),
+                0xffff_8000_0123_4560u64.to_le_bytes().to_vec(),
+            ),
+            (
+                compat::sysreg(3, 0, 13, 0, 4), // TPIDR_EL1
+                0xffff_0000_dead_beefu64.to_le_bytes().to_vec(),
+            ),
+            (
+                compat::sysreg(3, 0, 12, 0, 0), // VBAR_EL1
+                0xffff_8000_1000_0800u64.to_le_bytes().to_vec(),
+            ),
+        ];
+        if let Some(&v31) = arm64::reg_list(&vcpu.fd)
+            .unwrap()
+            .iter()
+            .rev()
+            .find(|&&id| arm64::reg_bytes(id) == 16)
+        {
+            regs.push((v31, (1u8..=16).collect()));
+        }
+        for (id, value) in &regs {
+            vcpu.fd.set_one_reg(*id, value).unwrap();
+        }
+        regs
+    }
+
+    #[cfg(all(checkpoint, target_arch = "aarch64"))]
+    #[test]
+    fn arm64_vcpu_state_survives_encoding_into_a_fresh_vcpu() {
+        use kvm_bindings::{KVM_MP_STATE_RUNNABLE, KVM_MP_STATE_STOPPED, kvm_mp_state};
+
+        let (_vm, vcpus, _intc) = test_vm(2);
+        let regs = distinctive_regs(&vcpus[1]);
+        // The guest brought vCPU 1 up (PSCI CPU_ON).
+        vcpus[1]
+            .fd
+            .set_mp_state(kvm_mp_state {
+                mp_state: KVM_MP_STATE_RUNNABLE,
+            })
+            .unwrap();
+        let states: Vec<VcpuState> = vcpus
+            .iter()
+            .map(|v| reencode(v.save_state().unwrap()))
+            .collect();
+
+        // A different VM, as a restore in a new process gets: its vCPU 1
+        // starts powered off.
+        let (_vm2, mut fresh, _intc2) = test_vm(2);
+        assert_eq!(fresh[1].fd.get_mp_state().unwrap().mp_state, KVM_MP_STATE_STOPPED);
+        for (vcpu, state) in fresh.iter_mut().zip(states) {
+            vcpu.restore_state(state).unwrap();
+        }
+        for (id, value) in regs {
+            let mut got = vec![0u8; value.len()];
+            fresh[1].fd.get_one_reg(id, &mut got).unwrap();
+            assert_eq!(got, value, "{}", compat::reg_name(id));
+        }
+        assert_eq!(fresh[1].fd.get_mp_state().unwrap().mp_state, KVM_MP_STATE_RUNNABLE);
+    }
+
+    /// A restore some time after the save must move the guest's counters on
+    /// by that time: a guest whose counter resumes where it stopped has its
+    /// clocks behind and its timers late by the whole gap.
+    #[cfg(all(checkpoint, target_arch = "aarch64"))]
+    #[test]
+    fn restore_moves_the_guest_counters_on_by_the_gap() {
+        let (vm, vcpus, intc) = test_vm(1);
+        let state = vcpus[0].save_state().unwrap();
+        let (saved, hz) = (state.counter.count, u64::from(state.counter.hz));
+        let saved_physical = state.reg_u64(arm64::PTIMER_CNT);
+        drop((vm, vcpus, intc));
+
+        let gap_ms: u64 = 500;
+        std::thread::sleep(std::time::Duration::from_millis(gap_ms));
+
+        let (_vm2, mut fresh, _intc2) = test_vm(1);
+        fresh[0].restore_state(state).unwrap();
+        let moved_ms = |id: u64, from: u64| {
+            arm64::read_u64(&fresh[0].fd, id).unwrap().wrapping_sub(from) * 1000 / hz
+        };
+        let virtual_ms = moved_ms(arm64::TIMER_CNT, saved);
+        assert!(
+            (gap_ms..gap_ms + 200).contains(&virtual_ms),
+            "the guest's virtual counter moved {virtual_ms} ms across a {gap_ms} ms gap"
+        );
+        // The physical counter is the host's, which kept counting too.
+        if let Some(saved_physical) = saved_physical {
+            let physical_ms = moved_ms(arm64::PTIMER_CNT, saved_physical);
+            assert!(
+                (gap_ms..gap_ms + 200).contains(&physical_ms),
+                "the guest's physical counter moved {physical_ms} ms across a {gap_ms} ms gap"
+            );
+        }
+    }
+
+    /// The import-time check (`probe_host`, a throwaway VM) must admit what a
+    /// VM built here saved, and refuse a guest that saw more than this host
+    /// offers.
+    #[cfg(all(checkpoint, target_arch = "aarch64"))]
+    #[test]
+    fn arm64_checkpoint_passes_on_the_host_that_took_it() {
+        let (vm, vcpus, _intc) = test_vm(1);
+        let saved = vm.host_record(&vcpus[0].save_state().unwrap());
+        let here = probe_host(1).unwrap();
+        assert_eq!(
+            (saved.midr, saved.vcpu_features, saved.gic_version, saved.counter_hz),
+            (here.midr, here.vcpu_features, here.gic_version, here.counter_hz)
+        );
+        assert!(!saved.id_regs.is_empty() && saved.regs.len() > 100, "{saved:?}");
+        assert_eq!(saved.id_regs, here.id_regs);
+        saved.check(&here).unwrap();
+
+        // The same guest saved on a CPU with a newer random number generator.
+        let mut foreign = saved.clone();
+        let isar0 = foreign
+            .id_regs
+            .iter_mut()
+            .find(|r| r.id == compat::sysreg(3, 0, 0, 6, 0))
+            .unwrap();
+        let rndr = isar0.value >> 60;
+        isar0.value = isar0.value & !(0xf << 60) | (rndr + 1) << 60;
+        let err = foreign.check(&here).unwrap_err();
+        assert!(err.contains("ID_AA64ISAR0_EL1.RNDR"), "{err}");
     }
 }

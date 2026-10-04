@@ -37,7 +37,10 @@ const ARCH_AARCH64: u32 = 2;
 const HV_KVM: u32 = 1;
 const HV_HVF: u32 = 2;
 
+#[cfg(target_arch = "x86_64")]
 const HOST: (u32, u32) = (ARCH_X86_64, HV_KVM);
+#[cfg(target_arch = "aarch64")]
+const HOST: (u32, u32) = (ARCH_AARCH64, HV_KVM);
 
 fn platform_name((arch, hv): (u32, u32)) -> String {
     let arch = match arch {
@@ -296,11 +299,37 @@ fn section<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vmm::checkpoint::compat::CAP_CLOCK_REALTIME;
     use crate::vmm::vstate::sample_states;
     use std::path::PathBuf;
     use vm_memory::{Bytes, GuestAddress};
     use vmm_sys_util::tempdir::TempDir;
+
+    #[cfg(target_arch = "x86_64")]
+    fn sample_host() -> HostRecord {
+        use crate::vmm::checkpoint::compat::CAP_CLOCK_REALTIME;
+        HostRecord::here(&[], 3_600_000, CAP_CLOCK_REALTIME, vec![0x10, 0x174])
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn sample_host() -> HostRecord {
+        HostRecord {
+            midr: 0x414f_d0b1,
+            revidr: 0,
+            page_size: 4096,
+            counter_hz: 54_000_000,
+            gic_version: 2,
+            vcpu_features: 1 << 2,
+            sve_vls: vec![],
+            id_regs: vec![],
+            regs: vec![0x6030_0000_0010_0000],
+        }
+    }
+
+    /// The other architecture's header code, and the names of both.
+    #[cfg(target_arch = "x86_64")]
+    const FOREIGN: (u32, &str, &str) = (ARCH_AARCH64, "aarch64", "x86_64");
+    #[cfg(target_arch = "aarch64")]
+    const FOREIGN: (u32, &str, &str) = (ARCH_X86_64, "x86_64", "aarch64");
 
     fn sample() -> (Checkpoint, GuestMemoryMmap) {
         let mem =
@@ -309,7 +338,7 @@ mod tests {
         mem.write_slice(b"ram", GuestAddress(0x1000)).unwrap();
         let (vm, vcpus) = sample_states(2);
         let checkpoint = Checkpoint {
-            host: HostRecord::here(&[], 3_600_000, CAP_CLOCK_REALTIME, vec![0x10, 0x174]),
+            host: sample_host(),
             ram: memory::layout(&mem),
             devices: vec![
                 DeviceId {
@@ -393,6 +422,9 @@ mod tests {
             buf[at..at + 4].copy_from_slice(&value.to_le_bytes());
             std::fs::write(dir.join(CHECKPOINT_FILE), buf).unwrap();
         };
+        let (foreign_arch, foreign, here) = FOREIGN;
+        let other_arch = format!("checkpoint was taken on {foreign}/KVM; this host is {here}/KVM");
+        let other_hypervisor = format!("checkpoint was taken on {here}/HVF");
         let cases: Vec<(&str, Box<dyn Fn(&PathBuf)>)> = vec![
             (
                 "incomplete checkpoint",
@@ -416,11 +448,11 @@ mod tests {
                 Box::new(move |d: &PathBuf| patch(d, 8, 1)),
             ),
             (
-                "checkpoint was taken on aarch64/KVM; this host is x86_64/KVM",
-                Box::new(move |d: &PathBuf| patch(d, 12, ARCH_AARCH64)),
+                &other_arch,
+                Box::new(move |d: &PathBuf| patch(d, 12, foreign_arch)),
             ),
             (
-                "checkpoint was taken on x86_64/HVF",
+                &other_hypervisor,
                 Box::new(move |d: &PathBuf| patch(d, 16, HV_HVF)),
             ),
             (

@@ -13,7 +13,7 @@
 
 use kvm_bindings::kvm_cpuid_entry2;
 
-use super::codec::{Decoder, Encoder, Pod};
+use crate::vmm::checkpoint::codec::{Decoder, Encoder, Pod};
 
 /// KVM_SET_CLOCK takes KVM_CLOCK_REALTIME: the saved kvmclock is anchored to
 /// wall-clock time, so a restore must be able to set it that way.

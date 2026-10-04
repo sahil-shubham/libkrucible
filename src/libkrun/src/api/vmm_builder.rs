@@ -277,7 +277,7 @@ impl VmmHandle {
     /// exist.
     ///
     /// Takes as long as writing the guest's RAM out does. Linux KVM on x86_64
-    /// only (see [`checkpoint_supported`]); elsewhere it returns
+    /// and aarch64 only (see [`checkpoint_supported`]); elsewhere it returns
     /// [`VmmError::FeatureDisabled`].
     pub fn save(&self, dir: &str) -> Result<(), VmmError> {
         #[cfg(checkpoint)]
@@ -383,7 +383,7 @@ pub fn check_nested_virt() -> bool {
 
 /// Whether this build, on this host, can save and restore VMs
 /// ([`VmmHandle::save`], [`VmmBuilder::restore_from`]): Linux KVM on x86_64
-/// for now.
+/// and aarch64 for now.
 #[cfg_attr(feature = "ffi", ffier::export)]
 pub fn checkpoint_supported() -> bool {
     #[cfg(checkpoint)]
@@ -398,13 +398,15 @@ pub fn checkpoint_supported() -> bool {
 
 /// Whether this host can restore the checkpoint in `dir`, without building a
 /// VM: the error carries the reason [`VmmBuilder::restore_from`] would refuse
-/// it here. A checkpoint records the host it was taken on; another CPU vendor
-/// or page size, CPU features or MSRs the guest uses that this host lacks, or a
-/// TSC rate this host can't run the guest at refuse it, as does a damaged or
-/// foreign `checkpoint.bin`. The RAM image isn't read.
+/// it here. A checkpoint records the host it was taken on; another CPU (x86:
+/// vendor; arm64: model and revision) or page size, CPU features the guest
+/// uses that this host lacks, or a guest clock this host can't run at (x86:
+/// TSC rate; arm64: counter frequency) refuse it, as do, on x86, MSRs and on
+/// arm64, registers or a GIC version this host's KVM can't restore, and a
+/// damaged or foreign `checkpoint.bin`. The RAM image isn't read.
 ///
-/// Linux KVM on x86_64 only (see [`checkpoint_supported`]); elsewhere it
-/// returns [`VmmError::FeatureDisabled`].
+/// Linux KVM on x86_64 and aarch64 only (see [`checkpoint_supported`]);
+/// elsewhere it returns [`VmmError::FeatureDisabled`].
 #[cfg_attr(feature = "ffi", ffier::export)]
 pub fn checkpoint_check_host(dir: &str) -> Result<(), VmmError> {
     #[cfg(checkpoint)]
